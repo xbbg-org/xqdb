@@ -1,0 +1,22 @@
+{
+  "name": "xqdb-darwin-arm64",
+  "version": "0.1.0",
+  "description": "macOS arm64 native addon for xqdb",
+  "author": "XQDB contributors",
+  "main": "xqdb.darwin-arm64.node",
+  "files": ["xqdb.darwin-arm64.node", "LICENSE"],
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xbbg-org/xqdb.git",
+    "directory": "js-xqdb"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

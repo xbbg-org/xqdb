@@ -15,8 +15,7 @@ tasks:
   venv:
     cmds:
       - uv venv --python 3.12
-      - uv pip install pip
-      - uv pip install -r py-kola/requirements.txt
+      - uv pip install --group dev --group benchmark
 
   test:
     cmds:
@@ -24,7 +23,11 @@ tasks:
 
   build-python:
     cmds:
-      - maturin develop --manifest-path py-kola/Cargo.toml
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 SETUPTOOLS_RUST_CARGO_PROFILE=release uv pip install --reinstall -e .
+
+  build-python-release:
+    cmds:
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 SETUPTOOLS_RUST_CARGO_PROFILE=release uv pip install --reinstall -e .
 
   install-python:
     deps:
@@ -35,15 +38,140 @@ tasks:
   test-python:
     deps:
       - build-python
-    dir: py-kola
     cmds:
-      - pytest -vv
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 pytest -vv py-xqdb/test
+
+  kdb-build:
+    preconditions:
+      - sh: test -n "$KX_BEARER_TOKEN"
+        msg: KX_BEARER_TOKEN must be set
+      - sh: test -n "$KDB_LICENSE_B64"
+        msg: KDB_LICENSE_B64 must be set
+    cmds:
+      - >-
+        podman build
+        --format docker
+        --secret id=kx-token,env=KX_BEARER_TOKEN
+        --secret id=kx-license,env=KDB_LICENSE_B64
+        --tag xqdb-kdb-test:local
+        --file testing/kdb/Containerfile
+        testing/kdb
+
+  kdb-start:
+    preconditions:
+      - sh: test -n "$KDB_LICENSE_B64"
+        msg: KDB_LICENSE_B64 must be set
+    cmds:
+      - cmd: |
+          set -e
+          cleanup() {
+            podman rm --force --ignore xqdb-kdb-test >/dev/null 2>&1 || \
+              echo "Failed to remove xqdb-kdb-test during cleanup" >&2
+            podman secret rm --ignore xqdb-kdb-license >/dev/null 2>&1 || \
+              echo "Failed to remove xqdb-kdb-license during cleanup" >&2
+          }
+          trap cleanup EXIT
+          podman image exists xqdb-kdb-test:local || task kdb-build
+          cleanup
+          podman secret create --replace --env=true xqdb-kdb-license KDB_LICENSE_B64
+          podman run --detach \
+            --name xqdb-kdb-test \
+            --publish 127.0.0.1:1801:1801/tcp \
+            --cpus 4 \
+            --memory 4g \
+            --tmpfs /run/kdb-license:rw,nosuid,nodev,noexec,size=1m \
+            --env XQDB_Q_ROWS=${XQDB_Q_ROWS:-10000} \
+            --secret xqdb-kdb-license,target=kdb-license-b64,type=mount \
+            xqdb-kdb-test:local
+          for attempt in $(seq 1 30); do
+            if podman healthcheck run xqdb-kdb-test >/dev/null 2>&1; then
+              trap - EXIT
+              exit 0
+            fi
+            sleep 1
+          done
+          podman logs xqdb-kdb-test
+          exit 1
+
+  kdb-stop:
+    cmds:
+      - cmd: |
+          status=0
+          podman rm --force --ignore xqdb-kdb-test || status=$?
+          podman secret rm --ignore xqdb-kdb-license || status=$?
+          exit "$status"
+
+  test-python-podman:
+    cmds:
+      - defer:
+          task: kdb-stop
+      - task: kdb-start
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 task build-python
+      - >-
+        env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64
+        XQDB_TEST_Q_EXTERNAL=1
+        XQDB_TEST_Q_HOST=127.0.0.1
+        XQDB_TEST_Q_PORT=1801
+        XQDB_Q_ROWS=${XQDB_Q_ROWS:-10000}
+        pytest -vv py-xqdb/test
+
+  benchmark-python-podman:
+    cmds:
+      - defer:
+          task: kdb-stop
+      - XQDB_Q_ROWS=${XQDB_Q_ROWS:-100000} task kdb-start
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 task build-python-release
+      - >-
+        env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64
+        XQDB_TEST_Q_HOST=127.0.0.1
+        XQDB_TEST_Q_PORT=1801
+        python py-xqdb/benchmarks/bench_ipc.py
+        --warmups ${XQDB_BENCH_WARMUPS:-2}
+        --iterations ${XQDB_BENCH_ITERATIONS:-100}
+
+
+  build-node-release:
+    dir: js-xqdb
+    cmds:
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 npm run build:release
+
+  test-node-podman:
+    cmds:
+      - defer:
+          task: kdb-stop
+      - XQDB_Q_ROWS=${XQDB_Q_ROWS:-10000} task kdb-start
+      - task: build-node-release
+      - >-
+        cd js-xqdb &&
+        env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64
+        XQDB_TEST_Q_EXTERNAL=1
+        XQDB_TEST_Q_HOST=127.0.0.1
+        XQDB_TEST_Q_PORT=1801
+        XQDB_Q_ROWS=${XQDB_Q_ROWS:-10000}
+        npm run test:live
+
+  benchmark-node-podman:
+    cmds:
+      - defer:
+          task: kdb-stop
+      - XQDB_Q_ROWS=${XQDB_BENCH_ROWS:-100000} task kdb-start
+      - task: build-node-release
+      - >-
+        cd js-xqdb &&
+        env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64
+        XQDB_TEST_Q_HOST=127.0.0.1
+        XQDB_TEST_Q_PORT=1801
+        XQDB_BENCH_ROWS=${XQDB_BENCH_ROWS:-100000}
+        XQDB_BENCH_WARMUPS=${XQDB_BENCH_WARMUPS:-2}
+        XQDB_BENCH_ITERATIONS=${XQDB_BENCH_ITERATIONS:-100}
+        XQDB_BENCH_MEMORY_RESULTS=${XQDB_BENCH_MEMORY_RESULTS:-5}
+        npm run benchmark
 
   tag:
     cmds:
-      - git tag {{.VERSION}} && git push origin tag {{.VERSION}}
+      - git tag v{{.VERSION}} && git push origin tag v{{.VERSION}}
 
   release-python:
     cmds:
-      - rm -rf dist
-      - maturin build --release --out dist -i python3.12 --manifest-path py-kola/Cargo.toml
+      - rm -rf dist build *.egg-info
+      - SETUPTOOLS_RUST_CARGO_PROFILE=release uv build --wheel --out-dir dist

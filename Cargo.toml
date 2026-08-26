@@ -1,25 +1,30 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "py-kola"]
+members = ["crates/*", "py-xqdb", "bindings/napi-xqdb"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "2.5.1"
-authors = ["Jo Shinonome <jo.shinonome@gmail.com>"]
+version = "0.1.0"
+authors = ["XQDB contributors"]
 edition = "2021"
-repository = "https://github.com/jshinonome/kola"
+repository = "https://github.com/xbbg-org/xqdb"
 license = "BSD-3-Clause"
-description = "a Python Polars interface to q"
+description = "a backend-agnostic Python dataframe interface to q"
 
 [profile.dev]
 opt-level = 1
 
 [profile.release]
 strip = true
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
+
+[profile.node-release]
+inherits = "release"
+opt-level = 3
+panic = "unwind"
 
 [workspace.dependencies.polars-buffer]
 default-features = false

@@ -1,0 +1,22 @@
+{
+  "name": "xqdb-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "Windows x64 native addon for xqdb",
+  "author": "XQDB contributors",
+  "main": "xqdb.win32-x64-msvc.node",
+  "files": ["xqdb.win32-x64-msvc.node", "LICENSE"],
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xbbg-org/xqdb.git",
+    "directory": "js-xqdb"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
