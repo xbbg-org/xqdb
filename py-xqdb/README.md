@@ -10,13 +10,13 @@ A Python interface to kdb+/q powered by Narwhals, with support for multiple data
 
 Optional backend packages: `pandas`, `polars`
 
-Install from the repository root (requires a Rust toolchain):
+Install the published package:
 
 ```bash
-python -m pip install .
+python -m pip install xqdb
 ```
 
-Or for development:
+To build from source for development with a Rust toolchain:
 
 ```bash
 python -m pip install -e .

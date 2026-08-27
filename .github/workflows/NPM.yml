@@ -1,0 +1,358 @@
+name: npm release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit SHA to build (dry runs only)
+        type: string
+      dry-run:
+        description: Build, pack, and smoke-test without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Validate release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      publish: ${{ steps.release.outputs.publish }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Validate versions and immutable tag
+        id: release
+        shell: bash
+        env:
+          LIVE_RELEASE: ${{ github.event_name == 'push' || inputs.dry-run == false }}
+          REQUESTED_SHA: ${{ inputs.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          version="$(node <<'NODE'
+          const { readFileSync } = require("node:fs");
+
+          const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
+          const root = readJson("js-xqdb/package.json");
+          const lock = readJson("js-xqdb/package-lock.json");
+          const nativePackages = [
+            ["xqdb-win32-x64-msvc", readJson("js-xqdb/npm/win32-x64-msvc/package.json")],
+            ["xqdb-linux-x64-gnu", readJson("js-xqdb/npm/linux-x64-gnu/package.json")],
+            ["xqdb-darwin-arm64", readJson("js-xqdb/npm/darwin-arm64/package.json")],
+          ];
+          const cargo = readFileSync("Cargo.toml", "utf8");
+          const workspaceStart = cargo.indexOf("[workspace.package]");
+          if (workspaceStart < 0) throw new Error("Cargo.toml has no [workspace.package] section");
+          const workspaceRest = cargo.slice(workspaceStart + "[workspace.package]".length);
+          const workspaceEnd = workspaceRest.search(/\r?\n\[/);
+          const workspaceSection = workspaceEnd < 0 ? workspaceRest : workspaceRest.slice(0, workspaceEnd);
+          const workspaceVersion = workspaceSection.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+
+          const version = root.version;
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+            throw new Error(`Node package version ${version} is not a stable semantic version`);
+          }
+          const parts = version.split(".").map(Number);
+          const floor = [0, 1, 1];
+          const belowFloor = parts.some((part, index) =>
+            part !== floor[index] && parts.slice(0, index).every((value, prior) => value === floor[prior])
+              ? part < floor[index]
+              : false,
+          );
+          if (belowFloor) throw new Error(`npm releases must be version 0.1.1 or newer, got ${version}`);
+
+          const versionedManifests = [
+            ["Cargo.toml workspace", workspaceVersion],
+            ["package-lock.json", lock.version],
+            ["package-lock.json root package", lock.packages?.[""]?.version],
+            ...nativePackages.map(([name, manifest]) => [`${name} package`, manifest.version]),
+          ];
+          for (const [label, actual] of versionedManifests) {
+            if (actual !== version) throw new Error(`${label} version ${actual} does not match ${version}`);
+          }
+
+          for (const [name, manifest] of nativePackages) {
+            if (manifest.name !== name) throw new Error(`Expected native package ${name}, got ${manifest.name}`);
+            if (root.optionalDependencies?.[name] !== version) {
+              throw new Error(`xqdb optional dependency ${name} must be exactly ${version}`);
+            }
+            if (lock.packages?.[""]?.optionalDependencies?.[name] !== version) {
+              throw new Error(`package-lock optional dependency ${name} must be exactly ${version}`);
+            }
+          }
+
+          process.stdout.write(version);
+          NODE
+          )"
+
+          sha="$(git rev-parse HEAD)"
+          expected_tag="v$version"
+
+          if [[ "$SOURCE_REF" == refs/tags/* && "$SOURCE_REF" != "refs/tags/$expected_tag" ]]; then
+            echo "Release ref $SOURCE_REF does not match package version $version." >&2
+            exit 1
+          fi
+
+          if [[ "$LIVE_RELEASE" == "true" ]]; then
+            if [[ -n "$REQUESTED_SHA" ]]; then
+              echo "Live releases cannot use a SHA override." >&2
+              exit 1
+            fi
+            if [[ "$SOURCE_REF" != "refs/tags/$expected_tag" ]]; then
+              echo "Live releases must run from exact tag $expected_tag." >&2
+              exit 1
+            fi
+            if ! actual_tag="$(git describe --tags --exact-match --match 'v[0-9]*')"; then
+              echo "Source commit $sha is not exactly tagged." >&2
+              exit 1
+            fi
+            if [[ "$actual_tag" != "$expected_tag" ]]; then
+              echo "Source tag $actual_tag does not match package version $version." >&2
+              exit 1
+            fi
+          fi
+
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+          echo "publish=$LIVE_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows-x64-msvc:
+    name: Build Windows x64 MSVC package
+    needs: source
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: js-xqdb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install JavaScript dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Build and pack native package
+        run: |
+          npm run build:native:release -- --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item xqdb.win32-x64-msvc.node npm/win32-x64-msvc/xqdb.win32-x64-msvc.node
+          npm pack ./npm/win32-x64-msvc --pack-destination artifacts
+      - name: Upload native package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-win32-x64-msvc
+          if-no-files-found: error
+          retention-days: 7
+          path: js-xqdb/artifacts/*.tgz
+
+  linux-x64-gnu:
+    name: Build Linux x64 GNU package
+    needs: source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4dc41da7df20400310c80d162a2fe2d2c2f3d9734d8dec20f6b9843711618deb
+    defaults:
+      run:
+        shell: bash
+        working-directory: js-xqdb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install JavaScript dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Build and pack native package
+        run: |
+          npm run build:native:release -- --target x86_64-unknown-linux-gnu
+          mkdir -p artifacts
+          cp xqdb.linux-x64-gnu.node npm/linux-x64-gnu/xqdb.linux-x64-gnu.node
+          npm pack ./npm/linux-x64-gnu --pack-destination artifacts
+          cp native.js native.d.ts artifacts/
+      - name: Upload native package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-linux-x64-gnu
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            js-xqdb/artifacts/*.tgz
+            js-xqdb/artifacts/native.js
+            js-xqdb/artifacts/native.d.ts
+
+  macos-arm64:
+    name: Build macOS arm64 package
+    needs: source
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: js-xqdb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install JavaScript dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Build and pack native package
+        run: |
+          npm run build:native:release -- --target aarch64-apple-darwin
+          mkdir -p artifacts
+          cp xqdb.darwin-arm64.node npm/darwin-arm64/xqdb.darwin-arm64.node
+          npm pack ./npm/darwin-arm64 --pack-destination artifacts
+      - name: Upload native package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-darwin-arm64
+          if-no-files-found: error
+          retention-days: 7
+          path: js-xqdb/artifacts/*.tgz
+
+  assemble:
+    name: Assemble and smoke-test npm packages
+    needs: [source, windows-x64-msvc, linux-x64-gnu, macos-arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: js-xqdb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install JavaScript dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Download native packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: npm-*
+          path: js-xqdb/artifacts
+          merge-multiple: true
+      - name: Build TypeScript and pack root package
+        run: |
+          cp artifacts/native.js native.js
+          cp artifacts/native.d.ts native.d.ts
+          npm run build:ts
+          npm pack --pack-destination artifacts
+      - name: Smoke-test packed Linux installation
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          root_tarball="$PWD/artifacts/xqdb-$VERSION.tgz"
+          linux_tarball="$PWD/artifacts/xqdb-linux-x64-gnu-$VERSION.tgz"
+          test -f "$PWD/artifacts/xqdb-win32-x64-msvc-$VERSION.tgz"
+          test -f "$PWD/artifacts/xqdb-darwin-arm64-$VERSION.tgz"
+          test -f "$root_tarball"
+          test -f "$linux_tarball"
+
+          smoke_dir="$RUNNER_TEMP/xqdb-npm-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$smoke_dir"
+          cd "$smoke_dir"
+          npm init -y
+          npm install --omit=optional --no-audit --no-fund "$root_tarball" "$linux_tarball"
+          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
+      - name: Upload assembled npm packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-packages
+          if-no-files-found: error
+          retention-days: 7
+          path: js-xqdb/artifacts/*.tgz
+
+  publish:
+    name: Publish npm packages
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/xqdb
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install trusted-publishing npm client
+        run: npm install --global npm@11.17.0 --no-audit --no-fund --registry https://registry.npmjs.org
+      - name: Download assembled npm packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-packages
+          path: dist
+      - name: Publish native packages, then xqdb
+        shell: bash
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          unset NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG
+
+          publish_if_missing() {
+            local name="$1"
+            local tarball="$2"
+            local published
+            if published="$(npm view "$name@$VERSION" version --registry https://registry.npmjs.org 2>/dev/null)" && [[ "$published" == "$VERSION" ]]; then
+              echo "$name@$VERSION is already published; leaving the immutable version unchanged."
+              return
+            fi
+            npm publish "$tarball" --access public --provenance --registry https://registry.npmjs.org
+          }
+
+          publish_if_missing xqdb-win32-x64-msvc "dist/xqdb-win32-x64-msvc-$VERSION.tgz"
+          publish_if_missing xqdb-linux-x64-gnu "dist/xqdb-linux-x64-gnu-$VERSION.tgz"
+          publish_if_missing xqdb-darwin-arm64 "dist/xqdb-darwin-arm64-$VERSION.tgz"
+          publish_if_missing xqdb "dist/xqdb-$VERSION.tgz"

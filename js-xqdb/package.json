@@ -1,6 +1,6 @@
 {
   "name": "xqdb",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Typed Node.js bindings for q IPC backed by xqdb",
   "author": "XQDB contributors",
   "type": "module",
@@ -51,9 +51,9 @@
     "apache-arrow": "^21.0.0"
   },
   "optionalDependencies": {
-    "xqdb-win32-x64-msvc": "0.1.0",
-    "xqdb-linux-x64-gnu": "0.1.0",
-    "xqdb-darwin-arm64": "0.1.0"
+    "xqdb-win32-x64-msvc": "0.1.1",
+    "xqdb-linux-x64-gnu": "0.1.1",
+    "xqdb-darwin-arm64": "0.1.1"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.4.1",

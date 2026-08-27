@@ -89,6 +89,12 @@ jobs:
         run: uv build --wheel --out-dir build-wheel
       - name: Repair manylinux wheel
         run: auditwheel repair build-wheel/*.whl --plat manylinux_2_28_x86_64 --wheel-dir dist
+      - name: Smoke-test wheel
+        run: |
+          uv venv smoke --python "$UV_PYTHON"
+          python="$PWD/smoke/bin/python"
+          uv pip install --python "$python" dist/*.whl
+          "$python" -c 'import xqdb; data = xqdb.serialize_as_ipc_bytes6("sync", False, 42); assert data'
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -117,6 +123,12 @@ jobs:
           version: latest-known
       - name: Build wheel
         run: uv build --wheel --out-dir dist
+      - name: Smoke-test wheel
+        run: |
+          uv venv smoke --python 3.12
+          python="$PWD/smoke/Scripts/python.exe"
+          uv pip install --python "$python" dist/*.whl
+          "$python" -c 'import xqdb; data = xqdb.serialize_as_ipc_bytes6("sync", False, 42); assert data'
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -125,10 +137,12 @@ jobs:
 
   macos:
     needs: source
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 60
     env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
       SETUPTOOLS_RUST_CARGO_PROFILE: release
+      _PYTHON_HOST_PLATFORM: macosx-11.0-arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -145,6 +159,16 @@ jobs:
           version: latest-known
       - name: Build wheel
         run: uv build --wheel --out-dir dist
+      - name: Verify wheel platform tag
+        run: |
+          wheel=(dist/*.whl)
+          [[ ${#wheel[@]} -eq 1 && ${wheel[0]} == *-macosx_11_0_arm64.whl ]]
+      - name: Smoke-test wheel
+        run: |
+          uv venv smoke --python 3.12
+          python="$PWD/smoke/bin/python"
+          uv pip install --python "$python" dist/*.whl
+          "$python" -c 'import xqdb; data = xqdb.serialize_as_ipc_bytes6("sync", False, 42); assert data'
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

@@ -8,7 +8,15 @@ XQDB is independent and not affiliated with or endorsed by KX. kdb+ is a tradema
 
 **Requirements**: Node.js ≥ 20
 
-In the 0.1.0 release, build from source (requires Rust toolchain):
+Install the published package:
+
+```bash
+npm install xqdb
+```
+
+The install selects the matching optional native package for Windows x64, Linux x64 with glibc 2.28 or newer, or macOS arm64.
+
+To build from source for development, install a Rust toolchain and run:
 
 ```bash
 # From the js-xqdb directory
@@ -16,7 +24,7 @@ npm install
 npm run build
 ```
 
-`npm run build:native` calls the napi-rs v3 CLI with `bindings/napi-xqdb/Cargo.toml` and generates the internal `native.js` loader, `native.d.ts`, and local `.node` artifact in this package. The generated loader checks the local artifact during development. In future releases, optional platform-specific native packages (`xqdb-win32-x64-msvc`, `xqdb-linux-x64-gnu`, `xqdb-darwin-arm64`) will be available via npm. The public entry point does not export the generated native declarations.
+`npm run build:native` calls the napi-rs v3 CLI with `bindings/napi-xqdb/Cargo.toml` and generates the internal `native.js` loader, `native.d.ts`, and local `.node` artifact in this package. The generated loader checks the local artifact during development. The public entry point does not export the generated native declarations.
 
 ## Connect and query
 

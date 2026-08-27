@@ -34,14 +34,13 @@ XQDB is independent and not affiliated with or endorsed by KX. kdb+ is a tradema
 
 **Requirements**: Python ≥ 3.10, Narwhals ≥ 2.10, PyArrow ≥ 20.0.0; pandas and Polars are optional backend packages
 
-Install from the repository root. The standard setuptools backend compiles the
-PyO3 extension through setuptools-rust:
+Install the published package:
 
 ```bash
-python -m pip install .
+python -m pip install xqdb
 ```
 
-Or for development:
+To build the Python package from source with setuptools-rust:
 
 ```bash
 python -m pip install -e .
@@ -51,7 +50,13 @@ python -m pip install -e .
 
 **Requirements**: Node.js ≥ 20
 
-Install from source:
+Install the published package:
+
+```bash
+npm install xqdb
+```
+
+To build the Node.js package from source for development:
 
 ```bash
 cd js-xqdb
