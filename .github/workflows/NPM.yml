@@ -130,9 +130,11 @@ jobs:
             fi
           fi
 
-          echo "commit=$sha" >> "$GITHUB_OUTPUT"
-          echo "publish=$LIVE_RELEASE" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "commit=$sha"
+            echo "publish=$LIVE_RELEASE"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
 
   windows-x64-msvc:
     name: Build Windows x64 MSVC package
