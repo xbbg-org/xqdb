@@ -70,14 +70,14 @@ jobs:
         run: |
           $version = node -p "require('./package.json').version"
           $platformVersion = node -p "require('./npm/win32-x64-msvc/package.json').version"
-          $rootTarball = (Resolve-Path "artifacts/xqdb-$version.tgz").Path
-          $platformTarball = (Resolve-Path "artifacts/xqdb-win32-x64-msvc-$platformVersion.tgz").Path
+          $rootTarball = (Resolve-Path "artifacts/xbbg-xqdb-$version.tgz").Path
+          $platformTarball = (Resolve-Path "artifacts/xbbg-xqdb-win32-x64-msvc-$platformVersion.tgz").Path
           $smokeDir = Join-Path $env:RUNNER_TEMP "xqdb-smoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           New-Item -ItemType Directory $smokeDir | Out-Null
           Set-Location $smokeDir
           npm init -y
           npm install --omit=optional --no-audit --no-fund $rootTarball $platformTarball
-          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
+          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
       - name: Upload packed packages and native addon
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -132,14 +132,14 @@ jobs:
         run: |
           version="$(node -p "require('./package.json').version")"
           platform_version="$(node -p "require('./npm/linux-x64-gnu/package.json').version")"
-          root_tarball="$PWD/artifacts/xqdb-$version.tgz"
-          platform_tarball="$PWD/artifacts/xqdb-linux-x64-gnu-$platform_version.tgz"
+          root_tarball="$PWD/artifacts/xbbg-xqdb-$version.tgz"
+          platform_tarball="$PWD/artifacts/xbbg-xqdb-linux-x64-gnu-$platform_version.tgz"
           smoke_dir="$RUNNER_TEMP/xqdb-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir "$smoke_dir"
           cd "$smoke_dir"
           npm init -y
           npm install --omit=optional --no-audit --no-fund "$root_tarball" "$platform_tarball"
-          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
+          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
       - name: Upload packed packages and native addon
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -189,14 +189,14 @@ jobs:
         run: |
           version="$(node -p "require('./package.json').version")"
           platform_version="$(node -p "require('./npm/darwin-arm64/package.json').version")"
-          root_tarball="$PWD/artifacts/xqdb-$version.tgz"
-          platform_tarball="$PWD/artifacts/xqdb-darwin-arm64-$platform_version.tgz"
+          root_tarball="$PWD/artifacts/xbbg-xqdb-$version.tgz"
+          platform_tarball="$PWD/artifacts/xbbg-xqdb-darwin-arm64-$platform_version.tgz"
           smoke_dir="$RUNNER_TEMP/xqdb-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir "$smoke_dir"
           cd "$smoke_dir"
           npm init -y
           npm install --omit=optional --no-audit --no-fund "$root_tarball" "$platform_tarball"
-          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
+          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
       - name: Upload packed packages and native addon
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

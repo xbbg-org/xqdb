@@ -29,6 +29,21 @@ interface PlatformPackageMetadata {
   readonly engines: Readonly<Record<string, string>>;
 }
 
+interface PackageLockMetadata {
+  readonly name: string;
+  readonly version: string;
+  readonly packages: Readonly<
+    Record<
+      string,
+      {
+        readonly name?: string;
+        readonly version?: string;
+        readonly optionalDependencies?: Readonly<Record<string, string>>;
+      }
+    >
+  >;
+}
+
 async function readPackageMetadata<T>(relativePath: string): Promise<T> {
   const text = await readFile(new URL(relativePath, import.meta.url), "utf8");
   return JSON.parse(text) as T;
@@ -38,8 +53,8 @@ describe("npm package metadata", () => {
   it("uses the public package name, Node floor, napi-rs v3 targets, and generated loader build", async () => {
     const root = await readPackageMetadata<RootPackageMetadata>("../package.json");
 
-    expect(root.name).toBe("xqdb");
-    expect(root.version).toBe("0.1.1");
+    expect(root.name).toBe("@xbbg/xqdb");
+    expect(root.version).toBe("0.1.2");
     expect(root.author).toBe("XQDB contributors");
     expect(root.repository.url).toBe("git+https://github.com/xbbg-org/xqdb.git");
     expect(root.engines.node).toBe(">=20");
@@ -53,9 +68,9 @@ describe("npm package metadata", () => {
       ],
     });
     expect(root.optionalDependencies).toEqual({
-      "xqdb-win32-x64-msvc": root.version,
-      "xqdb-linux-x64-gnu": root.version,
-      "xqdb-darwin-arm64": root.version,
+      "@xbbg/xqdb-win32-x64-msvc": root.version,
+      "@xbbg/xqdb-linux-x64-gnu": root.version,
+      "@xbbg/xqdb-darwin-arm64": root.version,
     });
     expect(root.scripts["build:native"]).toContain(
       "--manifest-path ../bindings/napi-xqdb/Cargo.toml",
@@ -79,7 +94,7 @@ describe("npm package metadata", () => {
     );
 
     expect(windows).toMatchObject({
-      name: "xqdb-win32-x64-msvc",
+      name: "@xbbg/xqdb-win32-x64-msvc",
       version: root.version,
       author: "XQDB contributors",
       repository: { url: "git+https://github.com/xbbg-org/xqdb.git" },
@@ -90,7 +105,7 @@ describe("npm package metadata", () => {
       engines: { node: ">=20" },
     });
     expect(linux).toMatchObject({
-      name: "xqdb-linux-x64-gnu",
+      name: "@xbbg/xqdb-linux-x64-gnu",
       version: root.version,
       author: "XQDB contributors",
       repository: { url: "git+https://github.com/xbbg-org/xqdb.git" },
@@ -102,7 +117,7 @@ describe("npm package metadata", () => {
       engines: { node: ">=20" },
     });
     expect(darwin).toMatchObject({
-      name: "xqdb-darwin-arm64",
+      name: "@xbbg/xqdb-darwin-arm64",
       version: root.version,
       author: "XQDB contributors",
       repository: { url: "git+https://github.com/xbbg-org/xqdb.git" },
@@ -114,4 +129,17 @@ describe("npm package metadata", () => {
     });
 
   });
+
+  it("keeps package-lock identity and optional dependencies synchronized", async () => {
+    const root = await readPackageMetadata<RootPackageMetadata>("../package.json");
+    const lock = await readPackageMetadata<PackageLockMetadata>("../package-lock.json");
+    const lockRoot = lock.packages[""];
+
+    expect(lock.name).toBe(root.name);
+    expect(lock.version).toBe(root.version);
+    expect(lockRoot?.name).toBe(root.name);
+    expect(lockRoot?.version).toBe(root.version);
+    expect(lockRoot?.optionalDependencies).toEqual(root.optionalDependencies);
+  });
+
 });

@@ -2,7 +2,7 @@
 
 XQDB is independent and not affiliated with or endorsed by KX. kdb+ is a trademark of KX.
 
-`xqdb` is the ESM Node.js binding for XQDB's q IPC client. It exposes a strict TypeScript facade, keeps q tables and typed vectors columnar with Apache Arrow, and runs connection work on a dedicated native worker instead of the JavaScript event loop.
+`@xbbg/xqdb` is the ESM Node.js binding for XQDB's q IPC client. It exposes a strict TypeScript facade, keeps q tables and typed vectors columnar with Apache Arrow, and runs connection work on a dedicated native worker instead of the JavaScript event loop.
 
 ## Installation
 
@@ -11,7 +11,7 @@ XQDB is independent and not affiliated with or endorsed by KX. kdb+ is a tradema
 Install the published package:
 
 ```bash
-npm install xqdb
+npm install @xbbg/xqdb
 ```
 
 The install selects the matching optional native package for Windows x64, Linux x64 with glibc 2.28 or newer, or macOS arm64.
@@ -29,7 +29,7 @@ npm run build
 ## Connect and query
 
 ```ts
-import { Q } from "xqdb";
+import { Q } from "@xbbg/xqdb";
 
 const q = await Q.connect({
   host: "localhost",
@@ -73,7 +73,7 @@ Always call `disconnect()` in `finally` or an equivalent cleanup hook instead of
 Pass q primitives and arbitrary lambdas as first-class arguments:
 
 ```ts
-import { XqdbQLambda, XqdbQOperator } from "xqdb";
+import { XqdbQLambda, XqdbQOperator } from "@xbbg/xqdb";
 
 await q.sync("{[op;a;b] .[op;(a;b)]}", XqdbQOperator.PLUS, 1, 2);
 await q.sync(
@@ -134,7 +134,7 @@ const scoped = new XqdbQLambda("{x+y}", "analytics");
 The temporal wrappers prevent nanosecond values from being rounded through JavaScript `number` or `Date`:
 
 ```ts
-import { XqdbTime, XqdbTimespan, XqdbTimestamp } from "xqdb";
+import { XqdbTime, XqdbTimespan, XqdbTimestamp } from "@xbbg/xqdb";
 
 const timestamp = new XqdbTimestamp(1_725_000_000_000_000_001n);
 const noon = new XqdbTime(43_200_000_000_000n);
@@ -150,7 +150,7 @@ Top-level `Buffer` and `Uint8Array` values remain lossless for arbitrary bytes. 
 Both helpers are asynchronous because their native parsing and serialization work runs away from the JavaScript event loop:
 
 ```ts
-import { readBinary6, serializeAsIpcBytes6 } from "xqdb";
+import { readBinary6, serializeAsIpcBytes6 } from "@xbbg/xqdb";
 
 const table = await readBinary6("trade.bin");
 const message = await serializeAsIpcBytes6("sync", true, table);
@@ -165,7 +165,7 @@ const message = await serializeAsIpcBytes6("sync", true, table);
 A pending `receive()` occupies its q connection until a message arrives or the socket timeout expires. A receive timeout fails with `XQDB_IO`, and the core closes that socket; callers must reconnect and resubscribe before receiving again. Use a dedicated `Q` for subscriptions and another for ordinary queries:
 
 ```ts
-import { XqdbIOError, Q } from "xqdb";
+import { XqdbIOError, Q } from "@xbbg/xqdb";
 
 const queries = await Q.connect(options);
 const subscription = await Q.connect(options);
@@ -206,9 +206,9 @@ Every error has a stable `code`, its original native text in `nativeMessage`, an
 
 | Platform | Native package | Requirement |
 | --- | --- | --- |
-| Windows x64 | `xqdb-win32-x64-msvc` | Microsoft x64 ABI |
-| Linux x64 | `xqdb-linux-x64-gnu` | glibc 2.28 or newer |
-| macOS arm64 | `xqdb-darwin-arm64` | Apple Silicon |
+| Windows x64 | `@xbbg/xqdb-win32-x64-msvc` | Microsoft x64 ABI |
+| Linux x64 | `@xbbg/xqdb-linux-x64-gnu` | glibc 2.28 or newer |
+| macOS arm64 | `@xbbg/xqdb-darwin-arm64` | Apple Silicon |
 
 Other operating-system, CPU, and libc combinations are unsupported in the initial release. A generated napi-rs loader reports an unsupported target or a missing optional binary instead of silently falling back to a different build.
 

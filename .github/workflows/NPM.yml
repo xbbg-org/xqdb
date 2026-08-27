@@ -54,9 +54,9 @@ jobs:
           const root = readJson("js-xqdb/package.json");
           const lock = readJson("js-xqdb/package-lock.json");
           const nativePackages = [
-            ["xqdb-win32-x64-msvc", readJson("js-xqdb/npm/win32-x64-msvc/package.json")],
-            ["xqdb-linux-x64-gnu", readJson("js-xqdb/npm/linux-x64-gnu/package.json")],
-            ["xqdb-darwin-arm64", readJson("js-xqdb/npm/darwin-arm64/package.json")],
+            ["@xbbg/xqdb-win32-x64-msvc", readJson("js-xqdb/npm/win32-x64-msvc/package.json")],
+            ["@xbbg/xqdb-linux-x64-gnu", readJson("js-xqdb/npm/linux-x64-gnu/package.json")],
+            ["@xbbg/xqdb-darwin-arm64", readJson("js-xqdb/npm/darwin-arm64/package.json")],
           ];
           const cargo = readFileSync("Cargo.toml", "utf8");
           const workspaceStart = cargo.indexOf("[workspace.package]");
@@ -66,18 +66,30 @@ jobs:
           const workspaceSection = workspaceEnd < 0 ? workspaceRest : workspaceRest.slice(0, workspaceEnd);
           const workspaceVersion = workspaceSection.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 
+          const expectedName = "@xbbg/xqdb";
+          if (root.name !== expectedName) {
+            throw new Error(`Expected root package ${expectedName}, got ${root.name}`);
+          }
+          const namedManifests = [
+            ["package-lock.json", lock.name],
+            ["package-lock.json root package", lock.packages?.[""]?.name],
+          ];
+          for (const [label, actual] of namedManifests) {
+            if (actual !== expectedName) throw new Error(`${label} name ${actual} does not match ${expectedName}`);
+          }
+
           const version = root.version;
           if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
             throw new Error(`Node package version ${version} is not a stable semantic version`);
           }
           const parts = version.split(".").map(Number);
-          const floor = [0, 1, 1];
+          const floor = [0, 1, 2];
           const belowFloor = parts.some((part, index) =>
             part !== floor[index] && parts.slice(0, index).every((value, prior) => value === floor[prior])
               ? part < floor[index]
               : false,
           );
-          if (belowFloor) throw new Error(`npm releases must be version 0.1.1 or newer, got ${version}`);
+          if (belowFloor) throw new Error(`npm releases must be version 0.1.2 or newer, got ${version}`);
 
           const versionedManifests = [
             ["Cargo.toml workspace", workspaceVersion],
@@ -92,7 +104,7 @@ jobs:
           for (const [name, manifest] of nativePackages) {
             if (manifest.name !== name) throw new Error(`Expected native package ${name}, got ${manifest.name}`);
             if (root.optionalDependencies?.[name] !== version) {
-              throw new Error(`xqdb optional dependency ${name} must be exactly ${version}`);
+              throw new Error(`@xbbg/xqdb optional dependency ${name} must be exactly ${version}`);
             }
             if (lock.packages?.[""]?.optionalDependencies?.[name] !== version) {
               throw new Error(`package-lock optional dependency ${name} must be exactly ${version}`);
@@ -291,10 +303,10 @@ jobs:
         env:
           VERSION: ${{ needs.source.outputs.version }}
         run: |
-          root_tarball="$PWD/artifacts/xqdb-$VERSION.tgz"
-          linux_tarball="$PWD/artifacts/xqdb-linux-x64-gnu-$VERSION.tgz"
-          test -f "$PWD/artifacts/xqdb-win32-x64-msvc-$VERSION.tgz"
-          test -f "$PWD/artifacts/xqdb-darwin-arm64-$VERSION.tgz"
+          root_tarball="$PWD/artifacts/xbbg-xqdb-$VERSION.tgz"
+          linux_tarball="$PWD/artifacts/xbbg-xqdb-linux-x64-gnu-$VERSION.tgz"
+          test -f "$PWD/artifacts/xbbg-xqdb-win32-x64-msvc-$VERSION.tgz"
+          test -f "$PWD/artifacts/xbbg-xqdb-darwin-arm64-$VERSION.tgz"
           test -f "$root_tarball"
           test -f "$linux_tarball"
 
@@ -303,7 +315,7 @@ jobs:
           cd "$smoke_dir"
           npm init -y
           npm install --omit=optional --no-audit --no-fund "$root_tarball" "$linux_tarball"
-          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
+          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("native serialization returned no bytes");'
       - name: Upload assembled npm packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -312,15 +324,17 @@ jobs:
           retention-days: 7
           path: js-xqdb/artifacts/*.tgz
 
+  # Trusted publisher claim: xbbg-org/xqdb, workflow NPM.yml, environment npm.
+  # Renaming this file or environment requires re-registering every npm package.
   publish:
     name: Publish npm packages
-    if: needs.source.outputs.publish == 'true'
+    if: needs.source.outputs.publish == 'true' && github.repository == 'xbbg-org/xqdb'
     needs: [source, assemble]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
       name: npm
-      url: https://www.npmjs.com/package/xqdb
+      url: https://www.npmjs.com/package/@xbbg/xqdb
     permissions:
       contents: read
       id-token: write
@@ -336,25 +350,72 @@ jobs:
         with:
           name: npm-packages
           path: dist
-      - name: Publish native packages, then xqdb
+      - name: Publish native packages, then @xbbg/xqdb
         shell: bash
         env:
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
           VERSION: ${{ needs.source.outputs.version }}
         run: |
+          bootstrap_npmrc=
+          cleanup_bootstrap() {
+            [[ -z "$bootstrap_npmrc" ]] || rm -f "$bootstrap_npmrc"
+          }
+          trap cleanup_bootstrap EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           unset NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG
+          if [[ -n "$NPM_BOOTSTRAP_TOKEN" ]]; then
+            bootstrap_npmrc="$RUNNER_TEMP/xqdb-bootstrap.npmrc"
+            (umask 077; printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_BOOTSTRAP_TOKEN" > "$bootstrap_npmrc")
+          fi
+
+          tarball_integrity() {
+            node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write(`sha512-${createHash("sha512").update(readFileSync(process.argv[1])).digest("base64")}`)' "$1"
+          }
 
           publish_if_missing() {
             local name="$1"
             local tarball="$2"
             local published
             if published="$(npm view "$name@$VERSION" version --registry https://registry.npmjs.org 2>/dev/null)" && [[ "$published" == "$VERSION" ]]; then
-              echo "$name@$VERSION is already published; leaving the immutable version unchanged."
+              local local_integrity
+              local remote_integrity
+              local_integrity="$(tarball_integrity "$tarball")"
+              remote_integrity="$(npm view "$name@$VERSION" dist.integrity --registry https://registry.npmjs.org)"
+              if [[ "$remote_integrity" != "$local_integrity" ]]; then
+                echo "$name@$VERSION is published with different content than $tarball." >&2
+                exit 1
+              fi
+              echo "$name@$VERSION is already published and byte-identical; leaving it unchanged."
               return
             fi
-            npm publish "$tarball" --access public --provenance --registry https://registry.npmjs.org
+
+            if npm view "$name" version --registry https://registry.npmjs.org >/dev/null 2>&1; then
+              (unset NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG; npm publish "$tarball" --access public --provenance --registry https://registry.npmjs.org)
+              return
+            fi
+
+            if [[ -z "$bootstrap_npmrc" ]]; then
+              echo "First publish of $name requires the protected bootstrap credential." >&2
+              exit 1
+            fi
+            (export NPM_CONFIG_USERCONFIG="$bootstrap_npmrc"; npm publish "$tarball" --access public --provenance --registry https://registry.npmjs.org)
           }
 
-          publish_if_missing xqdb-win32-x64-msvc "dist/xqdb-win32-x64-msvc-$VERSION.tgz"
-          publish_if_missing xqdb-linux-x64-gnu "dist/xqdb-linux-x64-gnu-$VERSION.tgz"
-          publish_if_missing xqdb-darwin-arm64 "dist/xqdb-darwin-arm64-$VERSION.tgz"
-          publish_if_missing xqdb "dist/xqdb-$VERSION.tgz"
+          publish_if_missing @xbbg/xqdb-win32-x64-msvc "dist/xbbg-xqdb-win32-x64-msvc-$VERSION.tgz"
+          publish_if_missing @xbbg/xqdb-linux-x64-gnu "dist/xbbg-xqdb-linux-x64-gnu-$VERSION.tgz"
+          publish_if_missing @xbbg/xqdb-darwin-arm64 "dist/xbbg-xqdb-darwin-arm64-$VERSION.tgz"
+          publish_if_missing @xbbg/xqdb "dist/xbbg-xqdb-$VERSION.tgz"
+      - name: Verify published package and provenance
+        shell: bash
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          unset NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG
+          verify_dir="$RUNNER_TEMP/xqdb-npm-verify-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$verify_dir"
+          cd "$verify_dir"
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "@xbbg/xqdb@$VERSION"
+          npm audit signatures
+          node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("published package returned no bytes");'

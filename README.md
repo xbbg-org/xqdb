@@ -53,7 +53,7 @@ python -m pip install -e .
 Install the published package:
 
 ```bash
-npm install xqdb
+npm install @xbbg/xqdb
 ```
 
 To build the Node.js package from source for development:
@@ -90,7 +90,7 @@ conn.disconnect()
 ### Node.js
 
 ```ts
-import { Q } from "xqdb";
+import { Q } from "@xbbg/xqdb";
 
 const conn = await Q.connect({
   host: "localhost",
