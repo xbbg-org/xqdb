@@ -39,11 +39,14 @@ dev = [
 # kola and qconnect are the benchmark competitors; requests is a qconnect
 # dependency it fails to declare. PyKX is deliberately absent: its licence
 # forbids publishing performance comparisons.
-# pandas 3 requires Python 3.11+, so it is gated rather than narrowing the
-# package's own requires-python. Benchmarks run on the 3.12 venv from `task venv`.
+# pandas is gated by version rather than narrowing the package's own
+# requires-python: pandas 3 needs Python 3.11+, and the benchmark needs pandas on
+# every supported interpreter because the subject table always includes a pandas
+# backend and the report reads pandas' version unconditionally.
 benchmark = [
   "polars==1.44.1",
   "pandas==3.0.5; python_version >= '3.11'",
+  "pandas==2.3.3; python_version < '3.11'",
   "kola==2.5.1",
   "qconnect==0.1.6",
   "requests==2.34.2",
