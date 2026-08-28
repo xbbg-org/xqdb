@@ -79,6 +79,23 @@ native_df = nw.to_native(result)  # PyArrow, pandas, or Polars Table/DataFrame
 
 Python `datetime`, `time`, and `timedelta` values have microsecond precision. q timestamp or timespan atoms with non-zero sub-microsecond nanoseconds raise `ValueError` instead of being truncated. q date or datetime atoms outside Python's representable range raise `OverflowError` instead of being clamped.
 
+A q timestamp carries no timezone, so it maps to a **naive** `datetime`. Timestamp atoms and Arrow `timestamp[ns]` columns therefore share the same timezone semantics, and for any value Python's `datetime` can represent they compare equal. XQDB does not label q values UTC, because a q process may hold local wall-clock times; apply your own zone when you know it.
+
+Query arguments accept both shapes. A naive `datetime` is used as the q wall clock unchanged. An aware `datetime` is resolved to UTC by Python, so fixed offsets, `zoneinfo` zones, and other `tzinfo` implementations all normalize to the correct instant, including across DST boundaries.
+
+Whole Series and DataFrame round-trips are always nanosecond-exact on every backend, because they cross the boundary as Arrow rather than as Python objects. **Single scalars pulled out of a frame are backend-dependent**, and the precision is decided by the backend before XQDB sees the value:
+
+| Backend | Scalar type | Sub-microsecond digits |
+| --- | --- | --- |
+| `pyarrow` (pandas installed) | `pandas.Timestamp` | preserved via `.nanosecond` |
+| `pyarrow` (no pandas) | — | PyArrow refuses to convert and raises |
+| `pandas` | `pandas.Timestamp` | preserved via `.nanosecond` |
+| `polars` | `datetime.datetime` | **truncated by Polars before XQDB sees it** |
+
+`pandas.Timestamp` keeps its sub-microsecond digits in `.nanosecond` rather than `.microsecond`, and XQDB reads that remainder so the full nanosecond reaches q. Polars materializes a plain `datetime`, so a nanosecond read out as a Polars scalar is already truncated and XQDB cannot recover it. When nanosecond fidelity matters, pass the frame or Series instead of a scalar.
+
+Reading a sub-microsecond value back as an *atom* still raises `ValueError`, because `datetime` cannot represent it — select it as a one-row table instead.
+
 ### Connect / Disconnect
 
 ```python
@@ -236,10 +253,10 @@ q scalars map to Python scalars; q vectors/tables are returned as Narwhals DataF
 | `char`      | 10  | 1    | `str`        |                             |
 | `string`    | 10  | 1    | `str`        |                             |
 | `symbol`    | 11  | \*   | `str`        |                             |
-| `timestamp` | 12  | 8    | `datetime`   |                             |
+| `timestamp` | 12  | 8    | `datetime`   | naive; no timezone attached |
 | `month`     | 13  | 4    | `-`          |                             |
 | `date`      | 14  | 4    | `date`       | 0001.01.01 - 9999.12.31     |
-| `datetime`  | 15  | 8    | `datetime`   |                             |
+| `datetime`  | 15  | 8    | `datetime`   | naive; no timezone attached |
 | `timespan`  | 16  | 8    | `timedelta`  |                             |
 | `minute`    | 17  | 4    | `time`       | 00:00 - 23:59               |
 | `second`    | 18  | 4    | `time`       | 00:00:00 - 23:59:59         |
@@ -289,7 +306,7 @@ Other selected backends receive the equivalent representation that Narwhals can 
 | `float`      | `float`     |                             |
 | `str`        | `symbol`    |                             |
 | `bytes`      | `string`    |                             |
-| `datetime`   | `timestamp` |                             |
+| `datetime`   | `timestamp` | naive used as-is; aware resolved to UTC |
 | `date`       | `date`      | 0001.01.01 - 9999.12.31     |
 | `timedelta`  | `timespan`  |                             |
 | `time`       | `time`      | 00:00:00.000 - 23:59:59.999 |

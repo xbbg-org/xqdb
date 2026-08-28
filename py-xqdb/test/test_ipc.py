@@ -1,7 +1,8 @@
 import importlib
 import math
 import os
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import narwhals as nw
 import pyarrow as pa
@@ -171,7 +172,7 @@ def test_call_argument_limit_is_checked_before_conversion():
         ("`q", "q"),
         (
             "1969.12.31D12:00:00.123456",
-            datetime(1969, 12, 31, 12, 0, 0, 123456, tzinfo=timezone.utc),
+            datetime(1969, 12, 31, 12, 0, 0, 123456),
         ),
         ("0001.01.01", date(1, 1, 1)),
         ("9999.12.31", date(9999, 12, 31)),
@@ -183,12 +184,140 @@ def test_call_argument_limit_is_checked_before_conversion():
         ("12:34:56.789", time(12, 34, 56, 789000)),
         (
             "2023.11.11T12:34:56.789",
-            datetime(2023, 11, 11, 12, 34, 56, 789000, tzinfo=timezone.utc),
+            datetime(2023, 11, 11, 12, 34, 56, 789000),
         ),
     ],
 )
 def test_read_scalar_invariance(q, query, expected):
     assert q.sync(query) == expected
+
+
+def test_timestamp_atoms_are_naive_and_agree_with_columns(q):
+    """A q timestamp has no timezone, so atoms and Arrow columns must match exactly."""
+    atom = q.sync("first exec time from ([] time:enlist 2024.01.02D03:04:05.000006)")
+    assert atom.tzinfo is None
+
+    frame = q.sync("([] time:enlist 2024.01.02D03:04:05.000006)")
+    column_value = nw.to_native(frame).column(0)[0].as_py()
+    assert column_value.tzinfo is None
+    assert atom == column_value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2024, 1, 2, 3, 4, 5, 6),
+        datetime(2024, 1, 2, 3, 4, 5, 6, tzinfo=timezone.utc),
+    ],
+)
+def test_datetime_arguments_accept_naive_and_aware(q, value):
+    """Values read back from naive columns must be usable as query arguments."""
+    assert q.sync("{x}", value) == value.replace(tzinfo=None)
+
+
+def test_nanosecond_column_scalars_round_trip_without_loss(q):
+    """A sub-microsecond column scalar must reach q intact.
+
+    PyArrow only yields a nanosecond-capable scalar when pandas is installed; it keeps
+    the sub-microsecond digits in `.nanosecond` rather than `.microsecond`, so those must
+    not be dropped. Without pandas, PyArrow refuses the conversion instead of truncating,
+    which is why this test requires pandas rather than asserting a fallback.
+    """
+    pytest.importorskip("pandas")
+    expr = "([] t:enlist 2024.01.02D03:04:05.000000001)"
+    scalar = nw.to_native(q.sync(expr)).column(0)[0].as_py()
+    assert scalar.nanosecond == 1
+    assert scalar.microsecond == 0
+
+    assert q.sync("{`long$x}", scalar) == q.sync(f"`long$first {expr}`t")
+
+
+@pytest.mark.parametrize("backend", ["pyarrow", "pandas", "polars"])
+def test_whole_frame_round_trips_are_nanosecond_exact(q, backend):
+    """Series and DataFrames cross as Arrow, so nanoseconds survive on every backend.
+
+    Parametrized per backend so a missing optional package skips only its own case
+    instead of hiding the backends that are installed.
+
+    Single scalars are deliberately not covered: their precision is decided by the
+    backend before XQDB sees the value, and the Polars backend materializes a plain
+    microsecond `datetime`. The Series and DataFrame paths are the guarantee XQDB makes.
+    """
+    pytest.importorskip(backend)
+    expr = "([] t:enlist 2024.01.02D03:04:05.000000001)"
+    original_backend = q.backend
+    try:
+        q.backend = backend
+        expected = q.sync(f"`long$first {expr}`t")
+
+        frame = q.sync(expr)
+        assert q.sync("{([] t:`long$x`t)}", frame)["t"].to_list()[0] == expected
+
+        series = q.sync(f"exec t from {expr}")
+        assert q.sync("{`long$x}", series).to_list()[0] == expected
+    finally:
+        q.backend = original_backend
+
+
+@pytest.mark.parametrize(
+    "zone,value,expected",
+    [
+        # Fixed offset.
+        (
+            timezone(timedelta(hours=-5)),
+            datetime(2024, 1, 2, 3, 4, 5),
+            datetime(2024, 1, 2, 8, 4, 5),
+        ),
+        # IANA zone on standard time (EST, UTC-5).
+        (
+            "America/New_York",
+            datetime(2024, 1, 2, 3, 4, 5),
+            datetime(2024, 1, 2, 8, 4, 5),
+        ),
+        # Same IANA zone on daylight time (EDT, UTC-4) must pick the other offset.
+        (
+            "America/New_York",
+            datetime(2024, 7, 2, 3, 4, 5),
+            datetime(2024, 7, 2, 7, 4, 5),
+        ),
+    ],
+)
+def test_aware_datetime_arguments_are_normalized_to_utc(q, zone, value, expected):
+    """Any tzinfo must resolve to the correct UTC instant rather than being rejected.
+
+    Zone keys are resolved inside the test body: Windows has no system tz database, so
+    building a `ZoneInfo` at collection time would fail the whole module instead of
+    skipping the zone-dependent cases.
+    """
+    if isinstance(zone, str):
+        try:
+            zone = ZoneInfo(zone)
+        except ZoneInfoNotFoundError:
+            pytest.skip(f"no system tz database for {zone!r}; install tzdata")
+    assert q.sync("{x}", value.replace(tzinfo=zone)) == expected
+
+
+def test_tzinfo_without_utcoffset_is_treated_as_naive(q):
+    """Python defines aware as tzinfo present AND `utcoffset()` not None.
+
+    A tzinfo whose `utcoffset()` returns None leaves the datetime naive, so its wall
+    clock must reach q unchanged. Routing it through `astimezone()` instead would make
+    the result depend on the host's local timezone.
+    """
+
+    class NoOffset(tzinfo):
+        def utcoffset(self, dt):
+            return None
+
+        def dst(self, dt):
+            return None
+
+        def tzname(self, dt):
+            return None
+
+    value = datetime(2024, 1, 2, 3, 4, 5, tzinfo=NoOffset())
+    assert value.utcoffset() is None
+    assert q.sync("{x}", value) == datetime(2024, 1, 2, 3, 4, 5)
 
 
 @pytest.mark.parametrize(

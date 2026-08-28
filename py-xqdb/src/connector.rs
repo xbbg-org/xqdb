@@ -6,7 +6,7 @@ use polars::prelude::{DataFrame, Series};
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::types::{
     PyBool, PyBytes, PyDate, PyDateTime, PyDelta, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
-    PyTuple, PyTzInfo,
+    PyTuple, PyTzInfo, PyTzInfoAccess,
 };
 use pyo3::{prelude::*, IntoPyObjectExt};
 use std::collections::HashSet;
@@ -170,7 +170,9 @@ fn cast_k_to_py_inner(py: Python, k: K, depth: usize) -> PyResult<Py<PyAny>> {
         K::DateTime(k) => {
             let (year, month, day) = python_date_parts(&k)?;
             let microsecond = python_microseconds(k.nanosecond(), "q timestamp")?;
-            let timezone = PyTzInfo::utc(py)?;
+            // A q timestamp carries no timezone, so it maps to a naive datetime. This
+            // matches the naive `timestamp[ns]` Arrow columns and avoids asserting UTC
+            // over q processes that store local wall-clock times.
             PyDateTime::new(
                 py,
                 year,
@@ -180,7 +182,7 @@ fn cast_k_to_py_inner(py: Python, k: K, depth: usize) -> PyResult<Py<PyAny>> {
                 k.minute() as u8,
                 k.second() as u8,
                 microsecond,
-                Some(&timezone),
+                None,
             )?
             .into_py_any(py)
         }
@@ -350,7 +352,62 @@ fn cast_to_k_inner(
     } else if any.is_none() {
         Ok(K::Null)
     } else if any.is_instance_of::<PyDateTime>() {
-        let value: chrono::DateTime<chrono::Utc> = any.cast::<PyDateTime>()?.extract()?;
+        let datetime = any.cast::<PyDateTime>()?;
+        let py = any.py();
+        // A q timestamp carries no timezone, so a naive datetime is taken as the q wall
+        // clock as-is and values read out of naive `timestamp[ns]` columns and atoms
+        // round-trip unchanged. Awareness uses Python's documented test,
+        // `d.tzinfo is not None and d.tzinfo.utcoffset(d) is not None`, asking the tzinfo
+        // directly rather than the datetime's own overrideable `utcoffset()`. Misjudging
+        // this would hand the value to `astimezone()`, which presumes the host's local
+        // zone for a naive datetime and would silently shift the wall clock.
+        let value: chrono::DateTime<chrono::Utc> = match datetime.get_tzinfo() {
+            None => datetime.extract::<chrono::NaiveDateTime>()?.and_utc(),
+            Some(tz) => {
+                let offset = tz.call_method1(pyo3::intern!(py, "utcoffset"), (&datetime,))?;
+                if offset.is_none() {
+                    // Python considers this naive. Drop the offsetless tzinfo without
+                    // touching the wall-clock fields.
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item(pyo3::intern!(py, "tzinfo"), py.None())?;
+                    datetime
+                        .call_method(pyo3::intern!(py, "replace"), (), Some(&kwargs))?
+                        .extract::<chrono::NaiveDateTime>()?
+                        .and_utc()
+                } else {
+                    // Let Python resolve the instant so fixed offsets, `zoneinfo` zones,
+                    // and any other tzinfo normalize identically, including across DST.
+                    let utc = PyTzInfo::utc(py)?;
+                    datetime
+                        .call_method1(pyo3::intern!(py, "astimezone"), (utc,))?
+                        .extract::<chrono::DateTime<chrono::Utc>>()?
+                }
+            }
+        };
+        // `pandas.Timestamp` subclasses `datetime` and keeps its sub-microsecond digits in
+        // `.nanosecond`, which the datetime accessors never expose. PyArrow hands back that
+        // type for `timestamp[ns]` scalars, so fold the remainder in to keep a nanosecond
+        // value read out of an Arrow column exact. Python offsets have at most microsecond
+        // resolution, so the remainder is invariant under the conversion above and the
+        // original object is the right source.
+        let value = match datetime.getattr_opt(pyo3::intern!(py, "nanosecond"))? {
+            Some(attr) => {
+                let remainder = attr.extract::<i64>()?;
+                if !(0..1_000).contains(&remainder) {
+                    return Err(PyValueError::new_err(
+                        "datetime.nanosecond must be between 0 and 999",
+                    ));
+                }
+                value
+                    .checked_add_signed(chrono::TimeDelta::nanoseconds(remainder))
+                    .ok_or_else(|| {
+                        PyOverflowError::new_err(
+                            "datetime is outside q's representable timestamp range",
+                        )
+                    })?
+            }
+            None => value,
+        };
         let nanoseconds = value.timestamp_nanos_opt().ok_or_else(|| {
             PyOverflowError::new_err("datetime is outside q's representable timestamp range")
         })?;
