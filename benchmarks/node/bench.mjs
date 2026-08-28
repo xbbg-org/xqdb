@@ -29,7 +29,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { cpus } from "node:os";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { Q, XqdbTimestamp } from "../../js-xqdb/dist/index.js";
@@ -638,6 +638,16 @@ async function main() {
   process.stdout.write(`\nwrote ${outputPath}\n`);
 }
 
+// Id of the lowest median among the subjects ranked for this operation.
+function fastestSubject(entry) {
+  let winner;
+  for (const [id, measured] of Object.entries(entry.subjects)) {
+    if (measured === undefined) continue;
+    if (winner === undefined || measured.medianMs < entry.subjects[winner].medianMs) winner = id;
+  }
+  return winner;
+}
+
 function renderSummary(report) {
   const ids = report.subjects.map((subject) => subject.id);
   const lines = [
@@ -649,12 +659,19 @@ function renderSummary(report) {
       .join("")}`,
   ];
   for (const [name, entry] of Object.entries(report.operations)) {
-    const medians = ids.map((id) => (entry.subjects[id] === undefined ? "n/a" : entry.subjects[id].medianMs.toFixed(3)).padStart(16));
+    const winner = fastestSubject(entry);
+    const medians = ids.map((id) =>
+      (entry.subjects[id] === undefined
+        ? "n/a"
+        : `${entry.subjects[id].medianMs.toFixed(3)}${id === winner ? " *" : "  "}`
+      ).padStart(16),
+    );
     const ratios = ids
       .slice(1)
       .map((id) => (entry.medianRatioVsXqdb[id] === undefined ? "excluded" : `${entry.medianRatioVsXqdb[id].toFixed(2)}x`).padStart(18));
     lines.push(`${name.padEnd(13)}${medians.join("")}${ratios.join("")}`);
   }
+  lines.push("* = fastest measured client for that operation");
   lines.push("", "fidelity (decoded value returned to q and compared with `~`)");
   for (const id of ids) {
     const entry = report.fidelity[id];
@@ -678,5 +695,13 @@ function renderSummary(report) {
   return `${lines.join("\n")}\n`;
 }
 
-await main();
-process.exit(0);
+export { renderSummary };
+
+// Guarded so the summary renderer can be imported and checked without running
+// a benchmark. `process.argv[1]` rather than `import.meta.main`, which needs
+// Node 24 and would silently skip the run on older releases.
+const entrypoint = typeof process.argv[1] === "string" ? pathToFileURL(process.argv[1]).href : undefined;
+if (import.meta.url === entrypoint) {
+  await main();
+  process.exit(0);
+}

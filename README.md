@@ -120,31 +120,38 @@ kdb+ or KDB-X performance. Full methodology, fidelity matrix, and raw reports:
 
 ### Node.js — Node 26.3.0, win32-x64
 
-| Operation      | XQDB                | jkdb 1.4.0        | node-q 2.7.0      |
-| -------------- | ------------------- | ----------------- | ----------------- |
-| `read trade`   | **24.8 ms** 424 MiB/s | 186.9 ms (7.6x) | 198.1 ms (8.0x)   |
-| `read wide`    | **91.0 ms** 535 MiB/s | 3072.7 ms (33.8x) | 3197.6 ms (35.2x) |
-| `read depth`   | **26.3 ms** 409 MiB/s | 203.0 ms (7.7x) | 201.6 ms (7.7x)   |
-| `send trade`   | **26.7 ms** 393 MiB/s | 46.4 ms (1.7x)  | not comparable    |
-| `send wide`    | **137.1 ms** 355 MiB/s | 179.4 ms (1.3x) | not comparable   |
-| `send depth`   | **28.8 ms** 374 MiB/s | 54.9 ms (1.9x)  | not comparable    |
-| scalar round trip | 0.35 ms          | 0.35 ms           | 0.36 ms           |
+★ marks the fastest measured client for that operation.
+
+| Operation      | XQDB                    | jkdb 1.4.0        | node-q 2.7.0      |
+| -------------- | ----------------------- | ----------------- | ----------------- |
+| `read trade`   | ★ **24.8 ms** 424 MiB/s | 186.9 ms (7.6x)   | 198.1 ms (8.0x)   |
+| `read wide`    | ★ **91.0 ms** 535 MiB/s | 3072.7 ms (33.8x) | 3197.6 ms (35.2x) |
+| `read depth`   | ★ **26.3 ms** 409 MiB/s | 203.0 ms (7.7x)   | 201.6 ms (7.7x)   |
+| `send trade`   | ★ **26.7 ms** 393 MiB/s | 46.4 ms (1.7x)    | not comparable    |
+| `send wide`    | ★ **137.1 ms** 355 MiB/s | 179.4 ms (1.3x)  | not comparable    |
+| `send depth`   | ★ **28.8 ms** 374 MiB/s | 54.9 ms (1.9x)    | not comparable    |
+| scalar round trip | 0.351 ms             | ★ 0.346 ms        | 0.361 ms          |
+
+XQDB is fastest on every table operation. jkdb takes the scalar round trip by
+5 microseconds, which is the latency floor of a single request rather than a
+codec difference.
 
 ### Python — CPython 3.12.13, win-amd64
 
 Ratios are against XQDB's PyArrow backend. kola returns Polars and qconnect
 returns pandas, so the report also carries a ratio against the XQDB backend
-that materialises the same frame type.
+that materialises the same frame type. XQDB's PyArrow backend is fastest on
+every operation.
 
-| Operation      | XQDB pyarrow          | XQDB polars | XQDB pandas | kola 2.5.1        | qconnect 0.1.6      |
-| -------------- | --------------------- | ----------- | ----------- | ----------------- | ------------------- |
-| `read trade`   | **14.6 ms** 717 MiB/s | 15.3 ms     | 17.6 ms     | 17.7 ms (1.2x)    | 97.7 ms (6.7x)      |
-| `read wide`    | **50.3 ms** 967 MiB/s | 51.2 ms     | 54.7 ms     | 105.8 ms (2.1x)   | 191.2 ms (3.8x)     |
-| `read depth`   | **18.3 ms** 590 MiB/s | 19.1 ms     | 35.7 ms     | 20.9 ms (1.1x)    | 11710.9 ms (642x)   |
-| `send trade`   | **20.3 ms** 517 MiB/s | 20.6 ms     | 23.3 ms     | 24.5 ms (1.2x)    | 64.0 ms (3.2x)      |
-| `send wide`    | **111.8 ms** 435 MiB/s | 115.7 ms   | 131.5 ms    | 124.0 ms (1.1x)   | 262.9 ms (2.4x)     |
-| `send depth`   | **23.6 ms** 457 MiB/s | 23.8 ms     | 54.1 ms     | aborts, see below | 2186.0 ms (92.7x)   |
-| scalar round trip | 0.35 ms            | 0.37 ms     | 0.35 ms     | 0.35 ms           | 0.40 ms             |
+| Operation      | XQDB pyarrow            | XQDB polars | XQDB pandas | kola 2.5.1        | qconnect 0.1.6    |
+| -------------- | ----------------------- | ----------- | ----------- | ----------------- | ----------------- |
+| `read trade`   | ★ **14.6 ms** 717 MiB/s | 15.3 ms     | 17.6 ms     | 17.7 ms (1.2x)    | 97.7 ms (6.7x)    |
+| `read wide`    | ★ **50.3 ms** 967 MiB/s | 51.2 ms     | 54.7 ms     | 105.8 ms (2.1x)   | 191.2 ms (3.8x)   |
+| `read depth`   | ★ **18.3 ms** 590 MiB/s | 19.1 ms     | 35.7 ms     | 20.9 ms (1.1x)    | 11710.9 ms (642x) |
+| `send trade`   | ★ **20.3 ms** 517 MiB/s | 20.6 ms     | 23.3 ms     | 24.5 ms (1.2x)    | 64.0 ms (3.2x)    |
+| `send wide`    | ★ **111.8 ms** 435 MiB/s | 115.7 ms   | 131.5 ms    | 124.0 ms (1.1x)   | 262.9 ms (2.4x)   |
+| `send depth`   | ★ **23.6 ms** 457 MiB/s | 23.8 ms     | 54.1 ms     | aborts, see below | 2186.0 ms (92.7x) |
+| scalar round trip | ★ 0.347 ms           | 0.366 ms    | 0.352 ms    | 0.350 ms          | 0.400 ms          |
 
 ### Correctness, measured alongside speed
 

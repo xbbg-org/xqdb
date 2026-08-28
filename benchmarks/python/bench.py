@@ -585,6 +585,16 @@ def parse_args():
     return args
 
 
+def fastest_subject(entry):
+    """Id of the lowest median among the subjects ranked for this operation."""
+    ranked = {
+        subject_id: measured["medianMs"]
+        for subject_id, measured in entry["subjects"].items()
+        if measured is not None
+    }
+    return min(ranked, key=ranked.get) if ranked else None
+
+
 def render_summary(report):
     ids = [subject["id"] for subject in report["subjects"]]
     reference = report["method"]["referenceSubject"]
@@ -596,15 +606,17 @@ def render_summary(report):
         "operation".ljust(13) + "".join(f"{subject_id} ms".rjust(17) for subject_id in ids),
     ]
     for name, entry in report["operations"].items():
-        cells = [
-            (
-                "n/a"
-                if entry["subjects"].get(subject_id) is None
-                else f"{entry['subjects'][subject_id]['medianMs']:.3f}"
-            ).rjust(17)
-            for subject_id in ids
-        ]
+        winner = fastest_subject(entry)
+        cells = []
+        for subject_id in ids:
+            measured = entry["subjects"].get(subject_id)
+            if measured is None:
+                cells.append("n/a".rjust(17))
+                continue
+            star = " *" if subject_id == winner else "  "
+            cells.append(f"{measured['medianMs']:.3f}{star}".rjust(17))
         lines.append(name.ljust(13) + "".join(cells))
+    lines.append("* = fastest measured client for that operation")
     lines += ["", f"median vs {reference}; (x) = vs the xqdb subject returning the same frame type"]
     for name, entry in report["operations"].items():
         parts = []
