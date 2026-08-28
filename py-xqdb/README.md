@@ -4,6 +4,34 @@ XQDB is independent and not affiliated with or endorsed by KX. kdb+ is a tradema
 
 A Python interface to kdb+/q powered by Narwhals, with support for multiple dataframe backends (PyArrow, pandas, Polars).
 
+## Upgrading to 0.1.4
+
+**Breaking change.** q timestamp atoms are now naive `datetime` values with
+`tzinfo is None`. Version 0.1.3 returned UTC-aware values.
+
+A q timestamp carries no timezone, and Arrow `timestamp[ns]` columns were already
+naive, so in 0.1.3 the same q value compared unequal depending on whether it was
+read as an atom or from a column, and a value read from a column could not be
+passed back as a query argument. Both now work.
+
+If you need an aware value, attach the zone yourself. Do not assume UTC unless
+your q process guarantees it — a process using `.z.P` stores local wall-clock
+times, and 0.1.3 labelled those UTC.
+
+```python
+# 0.1.3
+ts = conn.sync("first exec time from trade")   # datetime(..., tzinfo=timezone.utc)
+
+# 0.1.4
+ts = conn.sync("first exec time from trade")   # datetime(...)  naive
+ts = ts.replace(tzinfo=timezone.utc)           # only if the data really is UTC
+```
+
+Arguments now accept both shapes: a naive `datetime` keeps its wall clock, and an
+aware one normalizes through its UTC offset, including `zoneinfo` zones across DST
+boundaries. A `tzinfo` whose `utcoffset()` returns `None` counts as naive, per
+Python's own definition.
+
 ## Installation
 
 **Requirements**: Python ≥ 3.10 and < 3.15, Narwhals ≥ 2.10, PyArrow ≥ 20.0.0

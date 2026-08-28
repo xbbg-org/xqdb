@@ -25,8 +25,22 @@ tagging is what versions the wheel.
 
 `js-xqdb/package-lock.json` must not contain resolved `node_modules/@xbbg/xqdb-*`
 entries. A local `npm install` adds them pinned to the previously published
-version, which then contradicts the new `optionalDependencies` pin and breaks
-`npm ci`. Remove them before tagging.
+version, which then contradicts the new `optionalDependencies` pin. Remove them
+before tagging.
+
+Be aware that removing them does not make `npm ci` work either: with the entries
+absent, npm 11 aborts with `EUSAGE ... package.json and package-lock.json are not
+in sync`, naming all three natives as `Missing`, and `--omit=optional` fails
+identically. Between a version bump and the natives being published there is no
+lock state that satisfies `npm ci`, because the exact pin refers to a version the
+registry does not yet serve. This is why every workflow in `JS.yml` and `NPM.yml`
+uses `npm install`, never `npm ci`; do not "fix" them to `npm ci`. After the
+natives are published, `npm install --package-lock-only` will record matching
+entries, and `npm ci` works again until the next bump.
+
+Declaring `"workspaces": ["npm/*"]` to satisfy the pins locally does not work:
+workspace packages are linked unconditionally, so npm enforces their `os`/`cpu`
+fields and fails on any host with `notsup Valid cpu: arm64 / Actual cpu: x64`.
 
 No release automation script exists; the bump is a manual edit across the files
 above.
@@ -79,6 +93,21 @@ Conventional Commits, no `CHANGELOG.md`. Draft from
 `git log <prev-tag>..HEAD --no-merges --format="%s"`. Tags are annotated with the
 message `XQDB <version>`.
 
+Subject lines alone are not sufficient when a release changes observable
+behaviour. A subject-only note hides breaking changes, because the commit body
+never reaches the generated GitHub release. Any release containing one MUST spell
+out the old behaviour, the new behaviour, and the migration.
+
+`v0.1.4` carries one such change and must say so: q timestamp atoms returned by
+the Python binding are now naive `datetime` values (`tzinfo is None`), where
+0.1.3 returned UTC-aware ones. q timestamps carry no timezone and the Arrow
+`timestamp[ns]` columns were already naive, so atoms and columns now agree and a
+column value can be passed straight back as an argument. Callers that need an
+aware value must attach the zone themselves, and must not assume UTC unless the
+q process guarantees it. On input, naive arguments keep their wall clock, aware
+arguments normalize through their UTC offset including IANA DST, and a `tzinfo`
+whose `utcoffset(d)` is `None` counts as naive.
+
 ## CI Workflow Files
 
 - `.github/workflows/NPM.yml` — npm release on tag
@@ -89,4 +118,5 @@ message `XQDB <version>`.
 ## First-Time Setup Gaps
 
 None. Release workflows exist, build artifacts are gitignored, and tags are in
-use (`v0.1.0` through `v0.1.4`).
+use (`v0.1.0` through `v0.1.3`). `v0.1.4` is prepared in the manifests but not
+yet tagged.
