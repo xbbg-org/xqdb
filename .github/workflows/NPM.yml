@@ -370,7 +370,7 @@ jobs:
           fi
 
           tarball_integrity() {
-            node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write(`sha512-${createHash("sha512").update(readFileSync(process.argv[1])).digest("base64")}`)' "$1"
+            node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write("sha512-" + createHash("sha512").update(readFileSync(process.argv[1])).digest("base64"))' "$1"
           }
 
           publish_if_missing() {
@@ -416,6 +416,143 @@ jobs:
           mkdir "$verify_dir"
           cd "$verify_dir"
           npm init -y >/dev/null
-          npm install --ignore-scripts --no-audit --no-fund "@xbbg/xqdb@$VERSION"
-          npm audit signatures
+          install_published() {
+            npm install --force --ignore-scripts --no-audit --no-fund \
+              "@xbbg/xqdb@$VERSION" \
+              "@xbbg/xqdb-win32-x64-msvc@$VERSION" \
+              "@xbbg/xqdb-linux-x64-gnu@$VERSION" \
+              "@xbbg/xqdb-darwin-arm64@$VERSION"
+          }
+          for attempt in 1 2 3 4 5; do
+            if install_published; then
+              break
+            fi
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "Published packages did not become readable." >&2
+              exit 1
+            fi
+            sleep "$(( attempt * 10 ))"
+          done
+
+          audit_report="$verify_dir/signatures.json"
+          trap 'rm -f "$audit_report"' EXIT
+          verify_provenance() {
+            npm audit signatures --json --include-attestations > "$audit_report" || true
+            AUDIT_REPORT="$audit_report" node <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const report = JSON.parse(readFileSync(process.env.AUDIT_REPORT, "utf8"));
+          const subject = ({ name, version }) => `${name}@${version}`;
+          const expected = [
+            "@xbbg/xqdb",
+            "@xbbg/xqdb-win32-x64-msvc",
+            "@xbbg/xqdb-linux-x64-gnu",
+            "@xbbg/xqdb-darwin-arm64",
+          ].map((name) => `${name}@${process.env.VERSION}`);
+          const bad = new Set([...(report.invalid ?? []), ...(report.missing ?? [])].map(subject));
+          const failed = expected.filter((entry) => bad.has(entry));
+          if (failed.length !== 0) {
+            throw new Error(`Signature or attestation verification failed: ${failed.join(", ")}`);
+          }
+          const verified = new Map((report.verified ?? []).map((entry) => [subject(entry), entry]));
+          const missing = expected.filter((entry) => !verified.has(entry));
+          if (missing.length !== 0) {
+            throw new Error(`Missing verified provenance attestations: ${missing.join(", ")}`);
+          }
+          const invalidProvenance = expected.filter((entry) => {
+            const predicateType = verified.get(entry)?.attestations?.provenance?.predicateType;
+            return typeof predicateType !== "string" || !predicateType.startsWith("https://slsa.dev/provenance/");
+          });
+          if (invalidProvenance.length !== 0) {
+            throw new Error(`Missing SLSA build provenance: ${invalidProvenance.join(", ")}`);
+          }
+          NODE
+          }
+          for attempt in 1 2 3 4 5; do
+            if verify_provenance; then
+              break
+            fi
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "Published provenance did not become verifiable." >&2
+              exit 1
+            fi
+            sleep "$(( attempt * 10 ))"
+          done
           node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("published package returned no bytes");'
+  github-release:
+    name: Attach npm packages to GitHub Release
+    if: needs.source.outputs.publish == 'true' && github.repository == 'xbbg-org/xqdb'
+    needs: [source, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download assembled npm packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-packages
+          path: dist
+      - name: Attach packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.source.outputs.version }}
+        run: |
+          release_asset_digest() {
+            local asset_name="$1"
+            local assets
+            local name
+            local digest
+            assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq '.assets[] | [.name, .digest] | @tsv' 2>/dev/null)" || return 1
+            while IFS=$'\t' read -r name digest; do
+              if [[ "$name" == "$asset_name" ]]; then
+                printf '%s' "$digest"
+                return
+              fi
+            done <<< "$assets"
+          }
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ! gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes >/dev/null 2>&1; then
+              if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "GitHub Release $TAG could not be created or verified." >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          for asset in dist/*.tgz; do
+            if [[ ! -f "$asset" ]]; then
+              echo "No npm packages were downloaded." >&2
+              exit 1
+            fi
+            asset_name="${asset##*/}"
+            local_digest="sha256:$(sha256sum "$asset" | cut -d' ' -f1)"
+            remote_digest="$(release_asset_digest "$asset_name" || true)"
+            if [[ -n "$remote_digest" ]]; then
+              if [[ "$remote_digest" != "$local_digest" ]]; then
+                echo "Release asset $asset_name already exists with a different digest." >&2
+                exit 1
+              fi
+              continue
+            fi
+            gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            verified=false
+            for attempt in 1 2 3 4 5 6; do
+              remote_digest="$(release_asset_digest "$asset_name" || true)"
+              if [[ "$remote_digest" == "$local_digest" ]]; then
+                verified=true
+                break
+              fi
+              if [[ -n "$remote_digest" ]]; then
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$verified" != "true" ]]; then
+              echo "Release asset $asset_name could not be uploaded or verified." >&2
+              exit 1
+            fi
+          done

@@ -30,6 +30,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       commit: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.commit.outputs.version }}
+      tag: ${{ steps.commit.outputs.tag }}
     steps:
       - name: Validate live release source
         if: inputs.dry-run == false
@@ -64,6 +66,10 @@ jobs:
               echo "Release tag $actual_tag does not match workspace version $version." >&2
               exit 1
             fi
+            {
+              echo "version=$version"
+              echo "tag=$expected_tag"
+            } >> "$GITHUB_OUTPUT"
           fi
 
   linux:
@@ -198,10 +204,10 @@ jobs:
 
   release:
     name: Release
-    if: inputs.dry-run == false && inputs.sha == '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: inputs.dry-run == false && inputs.sha == '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.repository == 'xbbg-org/xqdb'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [linux, windows, macos, sdist]
+    needs: [source, github-release]
     environment:
       name: pypi
       url: https://pypi.org/project/xqdb
@@ -219,3 +225,81 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           attestations: true
+  github-release:
+    name: Attach Python distributions to GitHub Release
+    if: inputs.dry-run == false && inputs.sha == '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.repository == 'xbbg-org/xqdb'
+    needs: [source, linux, windows, macos, sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Attach distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          release_asset_digest() {
+            local asset_name="$1"
+            local assets
+            local name
+            local digest
+            assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq '.assets[] | [.name, .digest] | @tsv' 2>/dev/null)" || return 1
+            while IFS=$'\t' read -r name digest; do
+              if [[ "$name" == "$asset_name" ]]; then
+                printf '%s' "$digest"
+                return
+              fi
+            done <<< "$assets"
+          }
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ! gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes >/dev/null 2>&1; then
+              if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "GitHub Release $TAG could not be created or verified." >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          for asset in dist/*; do
+            if [[ ! -f "$asset" ]]; then
+              echo "No Python distributions were downloaded." >&2
+              exit 1
+            fi
+            asset_name="${asset##*/}"
+            local_digest="sha256:$(sha256sum "$asset" | cut -d' ' -f1)"
+            remote_digest="$(release_asset_digest "$asset_name" || true)"
+            if [[ -n "$remote_digest" ]]; then
+              if [[ "$remote_digest" != "$local_digest" ]]; then
+                echo "Release asset $asset_name already exists with a different digest." >&2
+                exit 1
+              fi
+              continue
+            fi
+            gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            verified=false
+            for attempt in 1 2 3 4 5 6; do
+              remote_digest="$(release_asset_digest "$asset_name" || true)"
+              if [[ "$remote_digest" == "$local_digest" ]]; then
+                verified=true
+                break
+              fi
+              if [[ -n "$remote_digest" ]]; then
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$verified" != "true" ]]; then
+              echo "Release asset $asset_name could not be uploaded or verified." >&2
+              exit 1
+            fi
+          done
