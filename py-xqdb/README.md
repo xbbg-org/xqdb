@@ -6,7 +6,7 @@ A Python interface to kdb+/q powered by Narwhals, with support for multiple data
 
 ## Installation
 
-**Requirements**: Python ≥ 3.10, Narwhals ≥ 2.10, PyArrow ≥ 20.0.0
+**Requirements**: Python ≥ 3.10 and < 3.15, Narwhals ≥ 2.10, PyArrow ≥ 20.0.0
 
 Optional backend packages: `pandas`, `polars`
 
