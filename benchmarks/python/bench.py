@@ -266,13 +266,18 @@ class Progress:
     """Progress on stderr so stdout stays the summary and the probe protocol.
 
     A full run is minutes long and a single subject can hold a round for over a
-    second, so silence is indistinguishable from a hang.
+    second, so silence is indistinguishable from a hang. A terminal gets a
+    rewritten line per round; a captured log gets one line every few seconds so
+    it stays readable.
     """
+
+    THROTTLE_SECONDS = 3.0
 
     def __init__(self, stream=sys.stderr):
         self.stream = stream
         self.interactive = stream.isatty()
         self.pending = False
+        self.last_step = 0.0
 
     def _write(self, text, transient):
         if transient and self.interactive:
@@ -286,9 +291,14 @@ class Progress:
         self.stream.flush()
 
     def line(self, text):
+        self.last_step = 0.0
         self._write(text, transient=False)
 
-    def step(self, text):
+    def step(self, text, force=False):
+        now = time.monotonic()
+        if not self.interactive and not force and now - self.last_step < self.THROTTLE_SECONDS:
+            return
+        self.last_step = now
         self._write(text, transient=True)
 
 
@@ -331,7 +341,8 @@ def run_operation(ids, operations, warmups, iterations, seed, check=None, progre
             remaining = elapsed / (round_index + 1) * (iterations - round_index - 1)
             progress.step(
                 f"{label} {round_index + 1}/{iterations} rounds, "
-                f"{format_duration(elapsed)} elapsed, {format_duration(remaining)} left"
+                f"{format_duration(elapsed)} elapsed, {format_duration(remaining)} left",
+                force=round_index in (0, iterations - 1),
             )
     return samples, order
 

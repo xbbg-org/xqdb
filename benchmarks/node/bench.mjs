@@ -293,10 +293,13 @@ function shuffled(list, seed, roundIndex) {
 
 // Progress on stderr so stdout stays the summary. A full run is minutes long
 // and a single subject can hold a round for seconds, so silence is
-// indistinguishable from a hang.
+// indistinguishable from a hang. A terminal gets a rewritten line per round; a
+// captured log gets one line every few seconds so it stays readable.
+const PROGRESS_THROTTLE_MS = 3000;
 const progress = {
   interactive: process.stderr.isTTY === true,
   pending: false,
+  lastStep: 0,
   write(text, transient) {
     if (transient && this.interactive) {
       process.stderr.write(`\r${text.padEnd(96).slice(0, 96)}`);
@@ -310,15 +313,21 @@ const progress = {
     process.stderr.write(`${text}\n`);
   },
   line(text) {
+    this.lastStep = 0;
     this.write(text, false);
   },
-  step(text) {
+  step(text, force = false) {
+    const now = Date.now();
+    if (!this.interactive && !force && now - this.lastStep < PROGRESS_THROTTLE_MS) return;
+    this.lastStep = now;
     this.write(text, true);
   },
 };
 
 function formatDuration(seconds) {
-  return seconds < 90 ? `${seconds.toFixed(0)}s` : `${Math.floor(seconds / 60)}m${String(Math.floor(seconds) % 60).padStart(2, "0")}s`;
+  return seconds < 90
+    ? `${seconds.toFixed(0)}s`
+    : `${Math.floor(seconds / 60)}m${String(Math.floor(seconds) % 60).padStart(2, "0")}s`;
 }
 
 // ── measurement ──────────────────────────────────────────────────────────────
