@@ -12,8 +12,8 @@ fails the release on any mismatch.
 | --------------------------------------------- | -------------------------------------------------------------- |
 | `Cargo.toml`                                  | `[workspace.package] version`                                  |
 | `Cargo.lock`                                  | `version` of packages `xqdb`, `napi-xqdb`, `py-xqdb`            |
-| `js-xqdb/package.json`                        | `version` and all three `optionalDependencies` pins (exact)     |
-| `js-xqdb/package-lock.json`                   | `version`, `packages[""].version`, `packages[""].optionalDependencies` |
+| `js-xqdb/package.json`                        | `version` only — see the pin note below                        |
+| `js-xqdb/package-lock.json`                   | `version`, `packages[""].version`                              |
 | `js-xqdb/npm/win32-x64-msvc/package.json`     | `version`                                                      |
 | `js-xqdb/npm/linux-x64-gnu/package.json`      | `version`                                                      |
 | `js-xqdb/npm/darwin-arm64/package.json`       | `version`                                                      |
@@ -23,24 +23,38 @@ The Python distribution has no version field: `pyproject.toml` sets
 `dynamic = ["version"]` and setuptools-scm derives it from the git tag, so
 tagging is what versions the wheel.
 
-`js-xqdb/package-lock.json` must not contain resolved `node_modules/@xbbg/xqdb-*`
-entries. A local `npm install` adds them pinned to the previously published
-version, which then contradicts the new `optionalDependencies` pin. Remove them
-before tagging.
+### Platform pins are injected, not committed
 
-Be aware that removing them does not make `npm ci` work either: with the entries
-absent, npm 11 aborts with `EUSAGE ... package.json and package-lock.json are not
-in sync`, naming all three natives as `Missing`, and `--omit=optional` fails
-identically. Between a version bump and the natives being published there is no
-lock state that satisfies `npm ci`, because the exact pin refers to a version the
-registry does not yet serve. This is why every workflow in `JS.yml` and `NPM.yml`
-uses `npm install`, never `npm ci`; do not "fix" them to `npm ci`. After the
-natives are published, `npm install --package-lock-only` will record matching
-entries, and `npm ci` works again until the next bump.
+Neither `js-xqdb/package.json` nor `js-xqdb/package-lock.json` may declare
+`optionalDependencies`, and the lock must contain no resolved
+`node_modules/@xbbg/xqdb-*` entries. The `source` job asserts both.
 
-Declaring `"workspaces": ["npm/*"]` to satisfy the pins locally does not work:
-workspace packages are linked unconditionally, so npm enforces their `os`/`cpu`
-fields and fails on any host with `notsup Valid cpu: arm64 / Actual cpu: x64`.
+The reason is that an exact pin names a version the registry does not serve until
+the platform packages publish, so any committed pin makes a fresh checkout of the
+release tag fail `npm ci` with `EUSAGE ... package.json and package-lock.json are
+not in sync`. Removing only the resolved entries does not help; npm then reports
+the three natives as `Missing` and `--omit=optional` fails identically. A tag is
+immutable, so a post-publish lock refresh cannot repair it.
+
+The `assemble` job therefore runs `npm run set-optional-deps`
+(`js-xqdb/scripts/set-optional-deps.mjs`) after `npm run build:ts` and before
+`npm pack`. It reads each `npm/*/package.json`, requires every name to be a
+`@xbbg/xqdb-` platform package at exactly the root version, and writes the pins.
+Immediately after packing, `node scripts/assert-packed-pins.mjs <tarball>
+<version>` extracts `package/package.json` from the tarball and fails unless all
+three pins are present at exactly that version. `publish` declares
+`needs: [source, assemble]`, so neither step can be skipped and a root package
+cannot be published without its pins.
+
+Two approaches that do **not** work, so do not retry them:
+
+- `napi prepublish -t npm --skip-optional-publish` validates that every
+  `npm/<target>/` already holds its `.node` and aborts with
+  `Release package ... is incomplete` otherwise. In `assemble` only the packed
+  platform tarballs exist, so it cannot run there.
+- `"workspaces": ["npm/*"]` links the platform directories unconditionally, so npm
+  enforces their `os`/`cpu` fields and fails on every host with
+  `notsup Valid cpu: arm64 / Actual cpu: x64`.
 
 No release automation script exists; the bump is a manual edit across the files
 above.

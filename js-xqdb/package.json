@@ -31,6 +31,7 @@
     "build": "npm run build:native && npm run build:ts",
     "create:npm-dirs": "napi create-npm-dirs",
     "artifacts": "napi artifacts --output-dir artifacts --npm-dir npm",
+    "set-optional-deps": "node scripts/set-optional-deps.mjs",
     "prepublishOnly": "npm run build:release && napi prepublish -t npm",
     "pretest": "npm run build:ts",
     "test": "vitest run",
@@ -48,11 +49,6 @@
   },
   "dependencies": {
     "apache-arrow": "^21.2.0"
-  },
-  "optionalDependencies": {
-    "@xbbg/xqdb-win32-x64-msvc": "0.1.4",
-    "@xbbg/xqdb-linux-x64-gnu": "0.1.4",
-    "@xbbg/xqdb-darwin-arm64": "0.1.4"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.4.1",

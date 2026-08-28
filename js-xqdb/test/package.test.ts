@@ -67,11 +67,10 @@ describe("npm package metadata", () => {
         "aarch64-apple-darwin",
       ],
     });
-    expect(root.optionalDependencies).toEqual({
-      "@xbbg/xqdb-win32-x64-msvc": root.version,
-      "@xbbg/xqdb-linux-x64-gnu": root.version,
-      "@xbbg/xqdb-darwin-arm64": root.version,
-    });
+    // Injected at pack time by scripts/set-optional-deps.mjs, deliberately absent from
+    // the committed manifest so the release tag stays npm ci-installable while the
+    // platform packages are unpublished.
+    expect(root.optionalDependencies).toBeUndefined();
     expect(root.scripts["build:native"]).toContain(
       "--manifest-path ../bindings/napi-xqdb/Cargo.toml",
     );
@@ -139,7 +138,10 @@ describe("npm package metadata", () => {
     expect(lock.version).toBe(root.version);
     expect(lockRoot?.name).toBe(root.name);
     expect(lockRoot?.version).toBe(root.version);
-    expect(lockRoot?.optionalDependencies).toEqual(root.optionalDependencies);
+    // Both must omit them: a pin naming an unpublished version makes `npm ci` abort
+    // with EUSAGE on a fresh checkout of the release tag.
+    expect(lockRoot?.optionalDependencies).toBeUndefined();
+    expect(root.optionalDependencies).toBeUndefined();
   });
 
 });

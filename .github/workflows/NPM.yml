@@ -101,13 +101,17 @@ jobs:
             if (actual !== version) throw new Error(`${label} version ${actual} does not match ${version}`);
           }
 
+          // The committed manifest and lock intentionally carry no optionalDependencies:
+          // the pins would name an unpublished version and break `npm ci` on the release
+          // tag. They are injected in the assemble job, which then asserts the packed
+          // tarball contains all three at exactly this version. Validate the platform
+          // manifests here so a skewed npm/ directory still fails before any build.
           for (const [name, manifest] of nativePackages) {
             if (manifest.name !== name) throw new Error(`Expected native package ${name}, got ${manifest.name}`);
-            if (root.optionalDependencies?.[name] !== version) {
-              throw new Error(`@xbbg/xqdb optional dependency ${name} must be exactly ${version}`);
-            }
-            if (lock.packages?.[""]?.optionalDependencies?.[name] !== version) {
-              throw new Error(`package-lock optional dependency ${name} must be exactly ${version}`);
+          }
+          for (const [label, container] of [["@xbbg/xqdb", root], ["package-lock root package", lock.packages?.[""]]]) {
+            if (container?.optionalDependencies !== undefined) {
+              throw new Error(`${label} must not declare optionalDependencies; they are injected at pack time`);
             }
           }
 
@@ -294,11 +298,19 @@ jobs:
           path: js-xqdb/artifacts
           merge-multiple: true
       - name: Build TypeScript and pack root package
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
         run: |
           cp artifacts/native.js native.js
           cp artifacts/native.d.ts native.d.ts
           npm run build:ts
+          # The committed manifest carries no optionalDependencies, so the release tag
+          # stays npm ci-installable while the natives are still unpublished. Inject the
+          # exact pins here, then prove they survived into the tarball. `publish` needs
+          # this job, so a failure below cannot publish a root package without pins.
+          npm run set-optional-deps
           npm pack --pack-destination artifacts
+          node scripts/assert-packed-pins.mjs "artifacts/xbbg-xqdb-$VERSION.tgz" "$VERSION"
       - name: Smoke-test packed Linux installation
         env:
           VERSION: ${{ needs.source.outputs.version }}
