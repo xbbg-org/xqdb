@@ -1,13 +1,22 @@
 {
   "name": "@xbbg/xqdb-linux-x64-gnu",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Linux x64 glibc native addon for xqdb",
   "author": "XQDB contributors",
   "main": "xqdb.linux-x64-gnu.node",
-  "files": ["xqdb.linux-x64-gnu.node", "LICENSE"],
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "libc": ["glibc"],
+  "files": [
+    "xqdb.linux-x64-gnu.node",
+    "LICENSE"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
   "engines": {
     "node": ">=20"
   },

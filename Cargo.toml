@@ -4,7 +4,7 @@ members = ["crates/*", "py-xqdb", "bindings/napi-xqdb"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 authors = ["XQDB contributors"]
 edition = "2021"
 repository = "https://github.com/xbbg-org/xqdb"

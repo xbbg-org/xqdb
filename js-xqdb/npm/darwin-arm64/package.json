@@ -1,12 +1,19 @@
 {
   "name": "@xbbg/xqdb-darwin-arm64",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "macOS arm64 native addon for xqdb",
   "author": "XQDB contributors",
   "main": "xqdb.darwin-arm64.node",
-  "files": ["xqdb.darwin-arm64.node", "LICENSE"],
-  "os": ["darwin"],
-  "cpu": ["arm64"],
+  "files": [
+    "xqdb.darwin-arm64.node",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
   "engines": {
     "node": ">=20"
   },
