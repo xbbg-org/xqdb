@@ -14,6 +14,7 @@ on:
       - "crates/**"
       - "bindings/**"
       - "py-xqdb/**"
+      - "benchmarks/python/**"
   pull_request:
     paths:
       - ".github/workflows/*.yml"
@@ -25,6 +26,7 @@ on:
       - "uv.lock"
       - "bindings/**"
       - "py-xqdb/**"
+      - "benchmarks/python/**"
   workflow_dispatch:
 
 permissions:

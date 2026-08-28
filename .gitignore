@@ -20,5 +20,4 @@ testing/kdb/.env
 testing/kdb/.env.*
 .pixi
 pixi.lock
-bench-*.json
 node_modules

@@ -12,6 +12,7 @@ on:
       - "crates/xqdb/**"
       - "bindings/napi-xqdb/**"
       - "js-xqdb/**"
+      - "benchmarks/node/**"
   pull_request:
     paths:
       - ".github/workflows/JS.yml"
@@ -21,6 +22,7 @@ on:
       - "crates/xqdb/**"
       - "bindings/napi-xqdb/**"
       - "js-xqdb/**"
+      - "benchmarks/node/**"
   workflow_dispatch:
 
 permissions:

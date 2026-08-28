@@ -442,6 +442,7 @@ def probe_subject(subject_id, host, port):
                     "event": "send",
                     "table": table,
                     "sendComparable": False,
+                    "roundTrip": "unverified",
                     "detail": f"encoder rejected the decoded frame: {identical['error']}",
                 }
             )
@@ -461,6 +462,13 @@ def probe_subject(subject_id, host, port):
                 "event": "send",
                 "table": table,
                 "sendComparable": comparable,
+                "roundTrip": (
+                    "identical"
+                    if comparable
+                    else "differs"
+                    if not bool(identical["value"])
+                    else "resized"
+                ),
                 "reencodesToIdenticalQValue": bool(identical["value"]),
                 "reencodedCanonicalBytes": reencoded_bytes,
                 "reencodedRows": reencoded_rows,
@@ -486,9 +494,11 @@ def discover(subject_id, host, port):
         line = line.strip()
         if line.startswith("{"):
             events.append(json.loads(line))
-
     report = {
-        "tables": {table: {"readable": False, "sendComparable": False} for table in TABLES},
+        "tables": {
+            table: {"readable": False, "sendComparable": False, "roundTrip": "unverified"}
+            for table in TABLES
+        },
         "probe": {
             "exitCode": completed.returncode,
             "completed": any(event["event"] == "done" for event in events),
@@ -517,6 +527,7 @@ def discover(subject_id, host, port):
             reached = ("send", event["table"])
             entry = report["tables"][event["table"]]
             entry["sendComparable"] = event["sendComparable"]
+            entry["roundTrip"] = event.get("roundTrip", "unverified")
             entry["reencodesToIdenticalQValue"] = event.get("reencodesToIdenticalQValue", False)
             entry["reencodedCanonicalBytes"] = event.get("reencodedCanonicalBytes")
             entry["reencodedRows"] = event.get("reencodedRows")
@@ -541,6 +552,8 @@ def discover(subject_id, host, port):
                     f"aborted the interpreter during read: {fatal}" if index == start else "not reached: an earlier operation aborted the interpreter"
                 )
             entry["sendComparable"] = False
+            # No comparison happened, so the round trip is unproven, not failed.
+            entry["roundTrip"] = "unverified"
             entry["sendExcludedBecause"] = (
                 f"aborted the interpreter during send: {fatal}"
                 if index == start and stage == "send"
@@ -583,6 +596,39 @@ def parse_args():
     if args.memory_results < 1:
         parser.error("--memory-results must be positive")
     return args
+
+
+ROUND_TRIP_UNPROVEN_PREFIXES = (
+    "encoder rejected the decoded frame",
+    "aborted the interpreter",
+    "not reached",
+    "the frame could not be decoded",
+)
+
+
+def round_trip_state(table_entry):
+    """identical / differs / resized / unverified for one table round trip.
+
+    `differs` requires q to have actually compared the two values. A bare
+    `reencodesToIdenticalQValue is False` cannot carry that on its own: it is
+    also the initial value when the encoder raised or aborted before any
+    comparison happened, and claiming a difference there would assert something
+    that was never measured. `roundTrip` is recorded by the preflight; the
+    derivation below is the compatibility path for reports written without it.
+    """
+    recorded = table_entry.get("roundTrip")
+    if recorded is not None:
+        return recorded
+    if table_entry.get("sendComparable"):
+        return "identical"
+    reason = table_entry.get("sendExcludedBecause") or ""
+    if reason.startswith(ROUND_TRIP_UNPROVEN_PREFIXES):
+        return "unverified"
+    if table_entry.get("reencodesToIdenticalQValue") is False:
+        return "differs"
+    if table_entry.get("reencodesToIdenticalQValue") is True:
+        return "resized"
+    return "unverified"
 
 
 def fastest_subject(entry):
@@ -636,17 +682,27 @@ def render_summary(report):
     for subject_id in ids:
         entry = report["fidelity"][subject_id]
         tables = " ".join(
-            f"{table}={'identical' if value['sendComparable'] else 'differs'}"
-            for table, value in entry["tables"].items()
+            f"{table}={round_trip_state(value)}" for table, value in entry["tables"].items()
         )
         lines.append(
             f"  {subject_id.ljust(14)} int64={'exact' if entry.get('int64Exact') else 'lossy'} "
             f"nanoseconds={entry.get('nanosecondTimestamp', 'unknown')} {tables}"
         )
     for name, entry in report["operations"].items():
+        table = name.split(".", 1)[1] if "." in name else None
         for subject_id in entry.get("roundTripUnverifiedSubjects", []):
             reason = entry["roundTripUnverifiedReasons"].get(subject_id, "unknown")
-            lines.append(f"  {name}: {subject_id} q round trip unverified - {reason}")
+            state = (
+                round_trip_state(report["fidelity"][subject_id]["tables"][table])
+                if table is not None
+                else "unverified"
+            )
+            label = (
+                "decoded frame differs from the fixture after a q round trip"
+                if state == "differs"
+                else "q round trip unverified"
+            )
+            lines.append(f"  {name}: {subject_id} {label} - {reason}")
         for excluded in entry.get("unsupported", []):
             lines.append(f"  excluded from {name}: {excluded['subject']} - {excluded['reason']}")
     return "\n".join(lines) + "\n"

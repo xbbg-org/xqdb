@@ -123,13 +123,29 @@ These come out of the preflight, and they are the reason the gates exist.
   fidelity check and measures the timed operations on the default connection.
 - **`kola@2.5.1`** panics in its Rust serializer and aborts the process when
   asked to send a frame with list columns:
-  `range end index 80040 out of range for slice of length 80000` at
-  `crates/kola/src/serde6.rs:1852`. It is excluded from `send.depth`; its
-  `depth` read is unaffected. kola also rounds nanosecond timestamps to
-  microseconds silently.
+  `range end index 800040 out of range for slice of length 800000` at
+  `crates/kola/src/serde6.rs:1852`, at the 100,000-row fixture. It is excluded
+  from `send.depth`, and because no comparison ever ran its `depth` round trip
+  is reported as `unverified` rather than `differs`; the `depth` read itself is
+  unaffected. kola also rounds nanosecond timestamps to microseconds silently.
 - **`xqdb`** raises `ValueError` rather than truncate a sub-microsecond
   timestamp atom into a Python `datetime`, so its `nanosecondTimestamp` is
   `rejected` rather than `lossy`.
+
+## Provenance of the checked-in reports
+
+`benchmarks/results/` holds one report per suite, both measured on the
+100,000-row fixture with 50 rounds per subject per operation. They were taken at
+the v0.1.3 codec: the Node report records subject version `0.1.3`, and the
+Python report records `0.1.4.dev0+gd04e01c.d20260828`, whose `d04e01c` is
+v0.1.3's commit and whose `.d` suffix is setuptools-scm's dirty-tree marker.
+
+v0.1.4 changes nothing the suite measures. `crates/xqdb` and
+`bindings/napi-xqdb` codec sources are untouched, and the one behavioural change
+is `py-xqdb`'s datetime *atom* conversion, which no measured operation
+exercises: the suite times table reads, table sends, and a float scalar.
+Re-measure before quoting these numbers for a later release that does touch the
+codec.
 
 ## Subjects we do not measure
 

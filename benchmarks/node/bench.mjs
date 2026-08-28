@@ -420,6 +420,16 @@ async function measureFidelity(subject, fixture) {
             ? "decoded value does not re-encode to a q-identical value"
             : `re-encoded canonical size ${entry.reencodedCanonicalBytes} != fixture ${fixture.tables[table].canonicalBytes}`;
     }
+    // `differs` requires q to have actually compared the two values. When the
+    // encoder threw, no comparison happened, so the round trip is unproven
+    // rather than failed, and the summary must not claim a value difference.
+    entry.roundTrip = entry.sendComparable
+      ? "identical"
+      : entry.encodeError !== undefined
+        ? "unverified"
+        : entry.reencodesToIdenticalQValue
+          ? "resized"
+          : "differs";
     report.tables[table] = entry;
   }
   return report;
@@ -638,6 +648,27 @@ async function main() {
   process.stdout.write(`\nwrote ${outputPath}\n`);
 }
 
+const ROUND_TRIP_UNPROVEN_PREFIXES = [
+  "encoder rejected the decoded value",
+  "aborted the interpreter",
+  "not reached",
+  "the frame could not be decoded",
+];
+
+// identical / differs / resized / unverified for one table round trip.
+// `roundTrip` is recorded by the preflight; the derivation below is the
+// compatibility path for reports written before that field existed.
+function roundTripState(tableEntry) {
+  if (tableEntry.roundTrip !== undefined) return tableEntry.roundTrip;
+  if (tableEntry.sendComparable) return "identical";
+  const reason = tableEntry.sendExcludedBecause ?? "";
+  if (ROUND_TRIP_UNPROVEN_PREFIXES.some((prefix) => reason.startsWith(prefix))) return "unverified";
+  if (tableEntry.reencodesToIdenticalQValue === false) return "differs";
+  if (tableEntry.reencodesToIdenticalQValue === true) return "resized";
+  return "unverified";
+}
+
+
 // Id of the lowest median among the subjects ranked for this operation.
 function fastestSubject(entry) {
   let winner;
@@ -676,7 +707,7 @@ function renderSummary(report) {
   for (const id of ids) {
     const entry = report.fidelity[id];
     const tables = Object.entries(entry.tables)
-      .map(([table, value]) => `${table}=${value.sendComparable ? "identical" : "differs"}`)
+      .map(([table, value]) => `${table}=${roundTripState(value)}`)
       .join(" ");
     lines.push(
       `  ${id.padEnd(7)} int64=${entry.int64Exact ? "exact" : `lossy(${entry.int64Decoded})`} nanoseconds=${
@@ -685,8 +716,14 @@ function renderSummary(report) {
     );
   }
   for (const [name, entry] of Object.entries(report.operations)) {
+    const table = name.includes(".") ? name.slice(name.indexOf(".") + 1) : undefined;
     for (const id of entry.roundTripUnverifiedSubjects ?? []) {
-      lines.push(`  ${name}: ${id} q round trip unverified - ${entry.roundTripUnverifiedReasons[id]}`);
+      const state = table === undefined ? "unverified" : roundTripState(report.fidelity[id].tables[table]);
+      const label =
+        state === "differs"
+          ? "decoded value differs from the fixture after a q round trip"
+          : "q round trip unverified";
+      lines.push(`  ${name}: ${id} ${label} - ${entry.roundTripUnverifiedReasons[id]}`);
     }
     for (const excluded of entry.unsupported ?? []) {
       lines.push(`  excluded from ${name}: ${excluded.subject} - ${excluded.reason}`);

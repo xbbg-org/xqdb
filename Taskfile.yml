@@ -168,9 +168,19 @@ tasks:
         --iterations ${XQDB_BENCH_ITERATIONS:-50}
         --memory-results ${XQDB_BENCH_MEMORY_RESULTS:-5}
 
+  # The release remote, not `origin`: `origin` is jshinonome/kola, the upstream
+  # this project forked from. Pushing a tag there aims an immutable ref at a
+  # third party and never triggers the npm release, which runs on xbbg-org/xqdb.
   tag:
+    vars:
+      REMOTE: '{{.REMOTE | default "xqdb"}}'
+    preconditions:
+      - sh: git remote get-url {{.REMOTE}}
+        msg: 'git remote {{.REMOTE}} is not configured; set REMOTE=<name> to override'
+      - sh: '[ "$(git remote get-url {{.REMOTE}})" != "$(git remote get-url origin 2>/dev/null)" ] || [ "{{.REMOTE}}" = "origin" ]'
+        msg: 'refusing to tag: {{.REMOTE}} resolves to the same URL as origin'
     cmds:
-      - git tag v{{.VERSION}} && git push origin tag v{{.VERSION}}
+      - git tag -a v{{.VERSION}} -m "XQDB {{.VERSION}}" && git push {{.REMOTE}} tag v{{.VERSION}}
 
   release-python:
     cmds:
