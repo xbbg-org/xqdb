@@ -12,11 +12,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 xqdb = { path = "../crates/xqdb" }
-pyo3 = { version = "0.29.1", features = ["chrono", "abi3-py310"] }
-thiserror = "2.0.18"
+pyo3 = { version = "0.29.2", features = ["chrono", "abi3-py310"] }
+thiserror = { workspace = true }
 polars-arrow.workspace = true
-chrono = "0.4.45"
-indexmap = "2.14.0"
+chrono = { workspace = true }
+indexmap = { workspace = true }
 
 [dependencies.polars]
 workspace = true

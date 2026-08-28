@@ -26,6 +26,14 @@ inherits = "release"
 opt-level = 3
 panic = "unwind"
 
+# Shared by the core crate and both bindings. Centralized so an advisory or
+# currency bump is a single edit instead of three manifests drifting apart.
+[workspace.dependencies]
+chrono = "0.4.45"
+indexmap = "2.14.0"
+thiserror = "2.0.18"
+uuid = "1.23.3"
+
 [workspace.dependencies.polars-buffer]
 default-features = false
 version = "0.55.2"
