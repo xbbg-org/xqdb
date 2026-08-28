@@ -487,6 +487,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.source.outputs.commit }}
       - name: Download assembled npm packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -513,13 +516,26 @@ jobs:
             done <<< "$assets"
           }
 
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if ! gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --generate-notes >/dev/null 2>&1; then
-              if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-                echo "GitHub Release $TAG could not be created or verified." >&2
-                exit 1
-              fi
+          notes_file="docs/release-notes/$TAG.md"
+          if [[ -f "$notes_file" ]]; then
+            notes_args=(--notes-file "$notes_file")
+          else
+            notes_args=(--generate-notes)
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A pre-created release keeps whatever body it has unless this release
+            # ships checked-in notes, which must win: --generate-notes produces only
+            # commit subjects and would silently drop any migration guidance.
+            if [[ -f "$notes_file" ]]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --notes-file "$notes_file" >/dev/null
+            fi
+          elif ! gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag "${notes_args[@]}" >/dev/null 2>&1; then
+            if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "GitHub Release $TAG could not be created or verified." >&2
+              exit 1
             fi
           fi
 

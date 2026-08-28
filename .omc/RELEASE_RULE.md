@@ -89,24 +89,24 @@ the live cases skip. `XQDB_Q_ROWS` must match the running fixture.
 
 ## Release Notes Strategy
 
-Conventional Commits, no `CHANGELOG.md`. Draft from
-`git log <prev-tag>..HEAD --no-merges --format="%s"`. Tags are annotated with the
-message `XQDB <version>`.
+Conventional Commits, no `CHANGELOG.md`. Tags are annotated with the message
+`XQDB <version>`.
+
+Notes live in `docs/release-notes/v<version>.md`, checked in before tagging. The
+`github-release` job in `NPM.yml` passes that file to `gh release create
+--notes-file` when it exists, and `gh release edit --notes-file` when the release
+was pre-created; it falls back to `--generate-notes` only when the file is
+absent. That job therefore checks the repository out — without a checkout the
+file is not on disk, and the release silently degrades to commit subjects.
 
 Subject lines alone are not sufficient when a release changes observable
-behaviour. A subject-only note hides breaking changes, because the commit body
-never reaches the generated GitHub release. Any release containing one MUST spell
-out the old behaviour, the new behaviour, and the migration.
+behaviour, because `--generate-notes` emits only subjects and never a commit
+body. Any release containing a breaking change MUST ship a notes file spelling
+out the old behaviour, the new behaviour, and the migration. Draft the routine
+part from `git log <prev-tag>..HEAD --no-merges --format="%s"`.
 
-`v0.1.4` carries one such change and must say so: q timestamp atoms returned by
-the Python binding are now naive `datetime` values (`tzinfo is None`), where
-0.1.3 returned UTC-aware ones. q timestamps carry no timezone and the Arrow
-`timestamp[ns]` columns were already naive, so atoms and columns now agree and a
-column value can be passed straight back as an argument. Callers that need an
-aware value must attach the zone themselves, and must not assume UTC unless the
-q process guarantees it. On input, naive arguments keep their wall clock, aware
-arguments normalize through their UTC offset including IANA DST, and a `tzinfo`
-whose `utcoffset(d)` is `None` counts as naive.
+`v0.1.4` carries one such change — Python q timestamp atoms are now naive where
+0.1.3 returned UTC-aware values — and its notes file already documents it.
 
 ## CI Workflow Files
 
