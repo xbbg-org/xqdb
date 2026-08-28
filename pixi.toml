@@ -30,7 +30,7 @@ fmt-check-rs = "cargo fmt --all -- --check"
 venv = """python -c "from pathlib import Path; import subprocess; subprocess.run(['uv', 'venv', '--python', '3.12', '.venv'], check=True) if not Path('.venv/pyvenv.cfg').is_file() else None" && uv pip install --python .venv --group dev --group benchmark"""
 build-python = { cmd = "uv pip install --python .venv --reinstall -e .", env = { SETUPTOOLS_RUST_CARGO_PROFILE = "release" } }
 test-python = "uv run --no-project --python .venv pytest -q py-xqdb/test"
-benchmark-python = "uv run --no-project --python .venv python py-xqdb/benchmarks/bench_ipc.py"
+benchmark-python = "uv run --no-project --python .venv python benchmarks/python/bench.py"
 
 # ── Features ──────────────────────────────────────────────────────────────────
 
@@ -42,7 +42,11 @@ js-install = { cmd = "npm install --no-audit --no-fund", cwd = "js-xqdb" }
 js-build = { cmd = "npm run build:release", cwd = "js-xqdb" }
 js-test = { cmd = "npm test", cwd = "js-xqdb" }
 js-test-live = { cmd = "npm run test:live", cwd = "js-xqdb" }
-js-benchmark = { cmd = "npm run benchmark", cwd = "js-xqdb" }
+js-benchmark-install = { cmd = "npm install --no-audit --no-fund", cwd = "benchmarks/node" }
+js-benchmark = { cmd = "node --expose-gc bench.mjs", cwd = "benchmarks/node", depends-on = [
+  "js-build",
+  "js-benchmark-install",
+] }
 
 # ── Environments ──────────────────────────────────────────────────────────────
 

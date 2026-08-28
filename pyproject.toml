@@ -33,7 +33,17 @@ dev = [
   "patchelf; sys_platform == 'linux'",
 ]
 # Exact pins keep benchmark runs comparable across machines and subjects.
-benchmark = ["polars==1.44.0"]
+# kola and qconnect are the benchmark competitors; requests is a qconnect
+# dependency it fails to declare. PyKX is deliberately absent: its licence
+# forbids publishing performance comparisons.
+benchmark = [
+  "polars==1.44.1",
+  "pandas==3.0.5",
+  "kola==2.5.1",
+  "qconnect==0.1.6",
+  "requests==2.34.2",
+  "psutil==7.2.2",
+]
 
 [project.urls]
 Repository = "https://github.com/xbbg-org/xqdb"

@@ -119,15 +119,16 @@ tasks:
     cmds:
       - defer:
           task: kdb-stop
-      - XQDB_Q_ROWS=${XQDB_Q_ROWS:-100000} task kdb-start
+      - XQDB_Q_ROWS=${XQDB_BENCH_ROWS:-100000} task kdb-start
       - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 task build-python-release
+      - env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64 uv pip install --group benchmark
       - >-
         env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64
         XQDB_TEST_Q_HOST=127.0.0.1
         XQDB_TEST_Q_PORT=1801
-        python py-xqdb/benchmarks/bench_ipc.py
-        --warmups ${XQDB_BENCH_WARMUPS:-2}
-        --iterations ${XQDB_BENCH_ITERATIONS:-100}
+        python benchmarks/python/bench.py
+        --warmups ${XQDB_BENCH_WARMUPS:-3}
+        --iterations ${XQDB_BENCH_ITERATIONS:-50}
 
 
   build-node-release:
@@ -156,16 +157,16 @@ tasks:
           task: kdb-stop
       - XQDB_Q_ROWS=${XQDB_BENCH_ROWS:-100000} task kdb-start
       - task: build-node-release
+      - cd benchmarks/node && npm install --no-audit --no-fund
       - >-
-        cd js-xqdb &&
+        cd benchmarks/node &&
         env -u KX_BEARER_TOKEN -u KDB_LICENSE_B64
         XQDB_TEST_Q_HOST=127.0.0.1
         XQDB_TEST_Q_PORT=1801
-        XQDB_BENCH_ROWS=${XQDB_BENCH_ROWS:-100000}
-        XQDB_BENCH_WARMUPS=${XQDB_BENCH_WARMUPS:-2}
-        XQDB_BENCH_ITERATIONS=${XQDB_BENCH_ITERATIONS:-100}
-        XQDB_BENCH_MEMORY_RESULTS=${XQDB_BENCH_MEMORY_RESULTS:-5}
-        npm run benchmark
+        node --expose-gc bench.mjs
+        --warmups ${XQDB_BENCH_WARMUPS:-3}
+        --iterations ${XQDB_BENCH_ITERATIONS:-50}
+        --memory-results ${XQDB_BENCH_MEMORY_RESULTS:-5}
 
   tag:
     cmds:

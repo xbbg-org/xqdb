@@ -331,7 +331,7 @@ function Benchmark-KdbContainer {
         Initialize-PythonEnvironment
         $python = Join-Path $repoRoot ".venv/Scripts/python.exe"
         $arguments = @(
-            "py-xqdb/benchmarks/bench_ipc.py",
+            "benchmarks/python/bench.py",
             "--warmups", "$Warmups",
             "--iterations", "$Iterations"
         )
@@ -379,6 +379,17 @@ function Initialize-NodeEnvironment {
     finally {
         Pop-Location
     }
+
+    Push-Location (Join-Path $repoRoot "benchmarks/node")
+    try {
+        & npm install --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) {
+            throw "benchmark npm install failed with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        Pop-Location
+    }
 }
 
 function Test-NodeKdbContainer {
@@ -406,8 +417,7 @@ function Benchmark-NodeKdbContainer {
     try {
         Initialize-NodeEnvironment
         $arguments = @(
-            "run", "benchmark", "--",
-            "--rows", "$Rows",
+            "--expose-gc", "bench.mjs",
             "--warmups", "$Warmups",
             "--iterations", "$Iterations"
         )
@@ -415,9 +425,9 @@ function Benchmark-NodeKdbContainer {
             $outputPath = [IO.Path]::GetFullPath($Output, (Get-Location).Path)
             $arguments += "--output", $outputPath
         }
-        Push-Location (Join-Path $repoRoot "js-xqdb")
+        Push-Location (Join-Path $repoRoot "benchmarks/node")
         try {
-            & npm @arguments
+            & node @arguments
             if ($LASTEXITCODE -ne 0) {
                 throw "Node comparison benchmark failed with exit code $LASTEXITCODE"
             }

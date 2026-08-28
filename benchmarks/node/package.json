@@ -1,0 +1,14 @@
+{
+  "name": "xqdb-node-benchmarks",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Node.js q IPC client comparison: xqdb vs jkdb vs node-q",
+  "type": "module",
+  "scripts": {
+    "bench": "node --expose-gc bench.mjs"
+  },
+  "dependencies": {
+    "jkdb": "1.4.0",
+    "node-q": "2.7.0"
+  }
+}
