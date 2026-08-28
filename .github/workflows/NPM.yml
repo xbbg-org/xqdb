@@ -375,7 +375,7 @@ jobs:
 
           publish_if_missing() {
             local name="$1"
-            local tarball="$2"
+            local tarball="./$2"
             local published
             if published="$(npm view "$name@$VERSION" version --registry https://registry.npmjs.org 2>/dev/null)" && [[ "$published" == "$VERSION" ]]; then
               local local_integrity
