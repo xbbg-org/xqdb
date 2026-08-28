@@ -30,15 +30,20 @@ dev = [
   "pytest>=8.4",
   "pandas>=2.2",
   "polars>=1.31.0",
+  # Windows ships no system tz database, so the DST normalization tests need this
+  # explicitly rather than relying on pandas to pull it in transitively.
+  "tzdata; sys_platform == 'win32'",
   "patchelf; sys_platform == 'linux'",
 ]
 # Exact pins keep benchmark runs comparable across machines and subjects.
 # kola and qconnect are the benchmark competitors; requests is a qconnect
 # dependency it fails to declare. PyKX is deliberately absent: its licence
 # forbids publishing performance comparisons.
+# pandas 3 requires Python 3.11+, so it is gated rather than narrowing the
+# package's own requires-python. Benchmarks run on the 3.12 venv from `task venv`.
 benchmark = [
   "polars==1.44.1",
-  "pandas==3.0.5",
+  "pandas==3.0.5; python_version >= '3.11'",
   "kola==2.5.1",
   "qconnect==0.1.6",
   "requests==2.34.2",
