@@ -56,7 +56,7 @@ q IPC authentication sends credentials in cleartext when TLS is disabled. Enable
 
 The default socket timeout is 30,000 milliseconds. `timeout` must be positive and cannot exceed 24 hours (86,400,000 milliseconds); the native layer rounds it up to the next whole second. The finite timeout lets a blocked receive eventually release the connection and its worker. `retries` is the number of additional attempts made by an explicit `connect()` after an IO failure; authentication failures are not retried. Query methods can establish the native connection automatically when needed.
 
-Each submitted argument set is limited to 64 MiB after native snapshot accounting, and encoded or decoded IPC messages are limited to 512 MiB. These bounds prevent one connection or hostile peer from forcing process-scale allocations; split larger workloads into smaller requests.
+Each submitted argument set is limited to 64 MiB after native snapshot accounting. Message size itself carries no fixed ceiling: a q result is bounded only by available memory and by the q header's 40-bit length field. Every process-sized buffer the native layer allocates — message body, decompression target, column data, and Arrow validity bitmaps — is reserved fallibly, so a result too large for the machine returns an error instead of terminating the process. A declared length on its own reserves at most 32 MiB — beyond that the response buffer grows eightfold only once the peer has filled the previous reservation, so the memory committed stays within eight times the bytes actually delivered — and a compressed response whose declared decompressed size is unreachable from the bytes received is rejected before its buffer is allocated, because the q IPC decompressor expands its input by at most 121x.
 
 `disconnect()` is idempotent. A `Q` can reconnect after disconnect:
 
@@ -158,7 +158,7 @@ const message = await serializeAsIpcBytes6("sync", true, table);
 
 `readBinary6()` resolves to an Arrow `Table`. `serializeAsIpcBytes6()` resolves to a Node.js `Buffer` containing one q IPC message.
 
-`readBinary6()` accepts regular local files up to 512 MiB and rejects Windows UNC/device paths.
+`readBinary6()` accepts regular local files that fit in available memory and rejects Windows UNC/device paths. It imposes no fixed size limit: a Kxzip-compressed file is rejected only when its declared decompressed size exceeds what its own LZ4 blocks can hold, which is the smaller of each block's uncompressed size and 255x the compressed bytes actually present.
 
 ## Subscriptions
 

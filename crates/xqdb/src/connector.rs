@@ -87,31 +87,51 @@ pub struct Connector {
 
 const IPC_HEADER_LENGTH: usize = 8;
 const MIN_SERIALIZED_VALUE_LENGTH: usize = 2;
-const MAX_IPC_MESSAGE_LENGTH: u64 = 512 * 1024 * 1024;
+/// Largest length the q IPC header can express: the byte at index 3 carries bits 32..40 and the
+/// little-endian u32 at index 4..8 carries the low bits. This is the wire format's own limit, not
+/// a policy ceiling, so nothing below it is refused.
+const MAX_IPC_LENGTH_FIELD: usize = (1 << 40) - 1;
+/// Upper bound on how far the q IPC decompressor can expand its input.
+///
+/// A group spends one control byte plus up to eight units; a back-reference unit spends two input
+/// bytes and emits at most 257, so the worst case is 2056 output bytes per 17 input bytes (< 121x).
+/// Output declared above this is unreachable from the payload already held in memory, so it is
+/// rejected before the destination buffer is allocated and zeroed. Measured against this client's
+/// own compressor on maximally compressible payloads: 120.935x at 10 MB, always below the bound.
+const MAX_IPC_DECOMPRESSION_RATIO: u64 = 121;
+/// First reservation for a message body, before the peer has delivered any of it, and the factor by
+/// which it grows once full.
+///
+/// The floor is what a declared length alone can reserve, and the cost of gating is a chunked read
+/// rather than the growth copies: measured against kola, a 64 KiB floor lost roughly a quarter of
+/// the throughput on a 51 MiB table and cutting copy volume sevenfold did not recover it. A floor
+/// above ordinary table payloads keeps those reads in a single pass, so only frames large enough to
+/// be worth gating pay for a growth step.
+const INITIAL_BODY_RESERVATION: usize = 32 * 1024 * 1024;
+const BODY_RESERVATION_FACTOR: usize = 8;
+
+/// Splits an IPC message length into the 40-bit form the q header carries, returning the high byte
+/// written at index 3 and the little-endian u32 written at index 4..8.
+pub(crate) fn ipc_length_header(total_length: usize) -> Result<(u8, u32), XqdbError> {
+    if total_length > MAX_IPC_LENGTH_FIELD {
+        return Err(XqdbError::Err(format!(
+            "IPC message length {total_length} exceeds the {MAX_IPC_LENGTH_FIELD}-byte q header length field"
+        )));
+    }
+    Ok(((total_length >> 32) as u8, total_length as u32))
+}
+
 fn checked_outgoing_message_length(
     body_length: usize,
     description: &str,
-) -> Result<(usize, u32), XqdbError> {
+) -> Result<(usize, u8, u32), XqdbError> {
     let total_length = body_length
         .checked_add(IPC_HEADER_LENGTH)
         .ok_or_else(|| XqdbError::Err(format!("{description} length overflowed")))?;
-    let total_length_u64 = u64::try_from(total_length).map_err(|_| {
-        XqdbError::Err(format!(
-            "{description} length cannot be represented as a 64-bit IPC length"
-        ))
-    })?;
-    if total_length_u64 > MAX_IPC_MESSAGE_LENGTH {
-        return Err(XqdbError::Err(format!(
-            "{description} length {total_length_u64} exceeds the {MAX_IPC_MESSAGE_LENGTH}-byte safety limit"
-        )));
-    }
-    let header_length = u32::try_from(total_length_u64).map_err(|_| {
-        XqdbError::Err(format!(
-            "{description} length {total_length_u64} cannot be represented in the IPC header"
-        ))
-    })?;
-    Ok((total_length, header_length))
+    let (high_byte, low_length) = ipc_length_header(total_length)?;
+    Ok((total_length, high_byte, low_length))
 }
+
 fn allocate_buffer(length: usize, description: &str) -> Result<Vec<u8>, XqdbError> {
     let mut buffer = Vec::new();
     buffer.try_reserve_exact(length).map_err(|error| {
@@ -123,12 +143,6 @@ fn allocate_buffer(length: usize, description: &str) -> Result<Vec<u8>, XqdbErro
 }
 
 fn checked_body_length(total_length: u64, description: &str) -> Result<usize, XqdbError> {
-    if total_length > MAX_IPC_MESSAGE_LENGTH {
-        return Err(XqdbError::Err(format!(
-            "{description} length {total_length} exceeds the {MAX_IPC_MESSAGE_LENGTH}-byte safety limit"
-        )));
-    }
-
     let total_length = usize::try_from(total_length).map_err(|_| {
         XqdbError::Err(format!(
             "{description} length cannot be represented on this platform"
@@ -142,6 +156,72 @@ fn checked_body_length(total_length: u64, description: &str) -> Result<usize, Xq
     if body_length < MIN_SERIALIZED_VALUE_LENGTH {
         return Err(XqdbError::Err(format!(
             "{description} body length {body_length} is too short to contain a serialized q value"
+        )));
+    }
+    Ok(body_length)
+}
+
+/// Reads a declared message body, keeping the reservation within `BODY_RESERVATION_FACTOR` times
+/// the bytes the peer has actually delivered.
+///
+/// A declared length alone must never turn into an allocation: on Windows, the platform this client
+/// ships prebuilt binaries for, a large `HeapAlloc` is forwarded to `VirtualAlloc(MEM_COMMIT)` and
+/// charged against the system commit limit immediately, so an 8-byte header claiming a terabyte
+/// would starve every other allocation in the process rather than merely reserving address space.
+/// The buffer therefore starts at `INITIAL_BODY_RESERVATION` and grows only once the previous
+/// reservation is full. Frames at or below the floor are reserved exactly and read in one pass.
+///
+/// Each `take` limit is clamped to the bytes still owed, which preserves the frame boundary and
+/// keeps `read_to_end` off the infallible `small_probe_read` growth path it takes when full.
+fn read_message_body(
+    stream: &mut (dyn QStream + Send + Sync),
+    body_length: usize,
+) -> Result<Vec<u8>, XqdbError> {
+    let mut body = allocate_buffer(
+        body_length.min(INITIAL_BODY_RESERVATION),
+        "IPC message body",
+    )?;
+    while body.len() < body_length {
+        if body.len() == body.capacity() {
+            let target = body_length.min(body.capacity().saturating_mul(BODY_RESERVATION_FACTOR));
+            body.try_reserve_exact(target - body.len())
+                .map_err(|error| {
+                    XqdbError::Err(format!(
+                        "Unable to grow the IPC message body to {target} bytes: {error}"
+                    ))
+                })?;
+        }
+        let owed = body_length - body.len();
+        let spare = (body.capacity() - body.len()).min(owed) as u64;
+        match StreamReader(&mut *stream)
+            .take(spare)
+            .read_to_end(&mut body)
+        {
+            Ok(0) => {
+                return Err(XqdbError::IOError(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "IPC message body ended before its declared length",
+                )))
+            }
+            Ok(_) => (),
+            Err(error) => return Err(XqdbError::IOError(error)),
+        }
+    }
+    Ok(body)
+}
+
+/// Validates a declared decompressed length against the payload that must produce it, so a corrupt
+/// or hostile prefix cannot demand an allocation those compressed bytes could never fill.
+fn checked_decompressed_body_length(
+    declared_total_length: u64,
+    compressed_payload_length: usize,
+) -> Result<usize, XqdbError> {
+    let body_length = checked_body_length(declared_total_length, "Decompressed IPC message")?;
+    let maximum_body_length =
+        (compressed_payload_length as u64).saturating_mul(MAX_IPC_DECOMPRESSION_RATIO);
+    if body_length as u64 > maximum_body_length {
+        return Err(XqdbError::DeserializationErr(format!(
+            "Decompressed IPC message length {declared_total_length} is unreachable from {compressed_payload_length} compressed bytes, which expand to at most {maximum_body_length} bytes"
         )));
     }
     Ok(body_length)
@@ -314,13 +394,13 @@ impl Connector {
                     let body_length = 6usize.checked_add(expr.len()).ok_or_else(|| {
                         XqdbError::Err("IPC request length overflowed".to_string())
                     })?;
-                    let (total_length, header_length) =
+                    let (total_length, high_byte, low_length) =
                         checked_outgoing_message_length(body_length, "IPC request")?;
                     let expression_length =
                         i32::try_from(expr.len()).map_err(|_| XqdbError::OverLengthErr())?;
                     let mut vec = allocate_buffer(total_length, "IPC request")?;
-                    vec.write_all(&[1, msg_type as u8, 0, 0])?;
-                    vec.write_all(&header_length.to_le_bytes())?;
+                    vec.write_all(&[1, msg_type as u8, 0, high_byte])?;
+                    vec.write_all(&low_length.to_le_bytes())?;
                     vec.write_all(&[10, 0])?;
                     vec.write_all(&expression_length.to_le_bytes())?;
                     vec.write_all(expr.as_bytes())?;
@@ -348,7 +428,7 @@ impl Connector {
                             XqdbError::Err("IPC request length overflowed".to_string())
                         })?;
                     }
-                    let (total_length, header_length) =
+                    let (total_length, high_byte, low_length) =
                         checked_outgoing_message_length(body_length, "IPC request")?;
                     let expression_length =
                         i32::try_from(expr.len()).map_err(|_| XqdbError::OverLengthErr())?;
@@ -356,8 +436,8 @@ impl Connector {
                         i32::try_from(args.len() + 1).map_err(|_| XqdbError::OverLengthErr())?;
 
                     let mut vec = allocate_buffer(total_length, "IPC request")?;
-                    vec.extend_from_slice(&[1, msg_type as u8, 0, 0]);
-                    vec.extend_from_slice(&header_length.to_le_bytes());
+                    vec.extend_from_slice(&[1, msg_type as u8, 0, high_byte]);
+                    vec.extend_from_slice(&low_length.to_le_bytes());
                     vec.extend_from_slice(&[0, 0]);
                     vec.extend_from_slice(&argument_count.to_le_bytes());
                     if is_lambda {
@@ -378,7 +458,7 @@ impl Connector {
                     let payload = if self.is_local || total_length < 10_000_000 {
                         vec
                     } else {
-                        compress(vec)
+                        compress(vec)?
                     };
                     match stream.write_all(&payload) {
                         Ok(_) => (),
@@ -446,30 +526,11 @@ impl Connector {
                         return Err(error);
                     }
                 };
-                let mut vec = match allocate_buffer(body_length, "IPC message body") {
+                let vec = match read_message_body(stream.as_mut(), body_length) {
                     Ok(vec) => vec,
                     Err(error) => {
                         self.shutdown()?;
                         return Err(error);
-                    }
-                };
-                // `read_to_end` with a `take` limit fills the reserved spare capacity directly,
-                // skipping the redundant zero-fill a `read_exact` destination would require.
-                match StreamReader(stream.as_mut())
-                    .take(body_length as u64)
-                    .read_to_end(&mut vec)
-                {
-                    Ok(read_length) if read_length == body_length => (),
-                    Ok(_) => {
-                        self.shutdown()?;
-                        return Err(XqdbError::IOError(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "IPC message body ended before its declared length",
-                        )));
-                    }
-                    Err(e) => {
-                        self.shutdown()?;
-                        return Err(XqdbError::IOError(e));
                     }
                 };
                 if compression_mode == 1 || compression_mode == 2 {
@@ -481,9 +542,9 @@ impl Connector {
                                 return Err(error);
                             }
                         };
-                    let decompressed_body_length = match checked_body_length(
+                    let decompressed_body_length = match checked_decompressed_body_length(
                         decompressed_length,
-                        "Decompressed IPC message",
+                        vec.len().saturating_sub(prefix_length),
                     ) {
                         Ok(length) => length,
                         Err(error) => {
@@ -501,7 +562,12 @@ impl Connector {
                             return Err(error);
                         }
                     };
-                    decompress(&vec, &mut decompressed, prefix_length)?;
+                    if let Err(error) = decompress(&vec, &mut decompressed, prefix_length) {
+                        // A frame that cannot be decompressed is protocol-malformed, so drop the
+                        // connection instead of letting a peer repeat the allocation indefinitely.
+                        self.shutdown()?;
+                        return Err(error);
+                    }
                     deserialize(&decompressed, &mut 0, false)
                 } else {
                     deserialize(&vec, &mut 0, false)
@@ -706,16 +772,27 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_frame_length_is_checked_before_header_conversion() {
-        let maximum_body = usize::try_from(MAX_IPC_MESSAGE_LENGTH).expect("512 MiB fits usize")
-            - IPC_HEADER_LENGTH;
-        let (_, header_length) =
+    fn outgoing_frame_length_is_bounded_only_by_the_q_length_field() {
+        let maximum_body = MAX_IPC_LENGTH_FIELD - IPC_HEADER_LENGTH;
+        let (total_length, high_byte, low_length) =
             checked_outgoing_message_length(maximum_body, "test frame").expect("limit-sized frame");
-        assert_eq!(u64::from(header_length), MAX_IPC_MESSAGE_LENGTH);
+        assert_eq!(total_length, MAX_IPC_LENGTH_FIELD);
+        assert_eq!(high_byte, 0xff);
+        assert_eq!(low_length, u32::MAX);
+        // A frame above 4 GiB is emitted through the 40-bit form rather than refused.
+        let (_, high_byte, low_length) =
+            checked_outgoing_message_length(4 * 1024 * 1024 * 1024, "test frame")
+                .expect("frame above u32::MAX");
+        assert_eq!(high_byte, 1);
+        assert_eq!(low_length, 8);
 
-        let error = checked_outgoing_message_length(maximum_body + 1, "test frame")
-            .expect_err("oversized frame must fail");
-        assert!(error.to_string().contains("safety limit"));
+        let message = checked_outgoing_message_length(maximum_body + 1, "test frame")
+            .expect_err("frame beyond the length field must fail")
+            .to_string();
+        assert!(
+            message.contains("q header length field") || message.contains("length overflowed"),
+            "unexpected error: {message}"
+        );
         assert!(checked_outgoing_message_length(usize::MAX, "test frame").is_err());
     }
 
@@ -747,22 +824,122 @@ mod tests {
     }
 
     #[test]
-    fn receive_rejects_oversized_decompressed_length() {
+    fn receive_rejects_decompressed_length_unreachable_from_its_payload() {
+        // An 8-byte prefix plus 8 compressed bytes expands to at most 968 bytes.
+        let mut response = response_header(2, 24);
+        response.extend_from_slice(&(64 * 1024 * 1024u64).to_le_bytes());
+        response.extend_from_slice(&[0u8; 8]);
+        let message = connector_with_response(response)
+            .receive()
+            .expect_err("unreachable decompressed length should fail")
+            .to_string();
+        assert!(
+            message.contains("Decompressed IPC message length 67108864")
+                && message.contains("unreachable from 8 compressed bytes"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn receive_rejects_an_absurd_decompressed_length_without_an_absolute_ceiling() {
+        // u64::MAX is addressable on a 64-bit target, so only the expansion bound rejects it.
         let mut response = response_header(2, 16);
         response.extend_from_slice(&u64::MAX.to_le_bytes());
+        let message = connector_with_response(response)
+            .receive()
+            .expect_err("absurd decompressed length should fail")
+            .to_string();
+        assert!(
+            message.contains("Decompressed IPC message length 18446744073709551615")
+                && message.contains("unreachable from 0 compressed bytes"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn no_absolute_ceiling_rejects_a_large_frame() {
+        // Both lengths from the report that the retired 512 MiB ceiling rejected: the wire frame
+        // and, for a compressed response, the declared decompressed length.
+        let total_length = 706_440_911u64;
+        let expected_body_length =
+            usize::try_from(total_length).expect("length fits usize") - IPC_HEADER_LENGTH;
+        assert_eq!(
+            checked_body_length(total_length, "IPC message").expect("large frame length"),
+            expected_body_length
+        );
+        // 6 MB of compressed payload expands 118x here, inside the decompressor's 121x reach.
+        assert_eq!(
+            checked_decompressed_body_length(total_length, 6_000_000)
+                .expect("large decompressed length"),
+            expected_body_length
+        );
+        // Nothing below the q length field is refused, including lengths far above 4 GiB.
+        let terabyte = 1024 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            checked_body_length(terabyte, "IPC message").expect("terabyte frame length"),
+            usize::try_from(terabyte).expect("length fits usize") - IPC_HEADER_LENGTH
+        );
+    }
+
+    #[test]
+    fn a_declared_length_alone_does_not_reserve_the_body() {
+        // 512 GiB declared, 64 bytes delivered. The gate means the reservation never leaves the
+        // initial chunk, so this fails as a short read; reserving the declared length up front
+        // would instead fail as an allocation error wherever the allocator refuses 512 GiB.
+        let mut response = response_header(0, 512 * 1024 * 1024 * 1024);
+        response.extend_from_slice(&[0u8; 64]);
         let error = connector_with_response(response)
             .receive()
-            .expect_err("oversized decompressed length should fail");
-        assert!(error.to_string().contains("Decompressed IPC"));
-        assert!(error.to_string().contains("safety limit"));
+            .expect_err("a stalled oversized frame must fail");
+        assert!(
+            matches!(&error, XqdbError::IOError(io_error)
+                if io_error.kind() == io::ErrorKind::UnexpectedEof),
+            "unexpected error: {error}"
+        );
     }
+
     #[test]
-    fn receive_rejects_message_above_safety_limit() {
-        let error = connector_with_response(response_header(0, MAX_IPC_MESSAGE_LENGTH + 1))
+    fn receive_stops_at_the_declared_length_and_reports_a_short_body() {
+        // A body that ends early fails as a short read instead of deserializing a partial frame.
+        let mut response = response_header(0, 4096);
+        response.extend_from_slice(&[0u8; 64]);
+        let error = connector_with_response(response)
             .receive()
-            .expect_err("oversized IPC message should fail");
-        assert!(error.to_string().contains("exceeds"));
-        assert!(error.to_string().contains("safety limit"));
+            .expect_err("a truncated frame must fail");
+        assert!(
+            matches!(&error, XqdbError::IOError(io_error)
+                if io_error.kind() == io::ErrorKind::UnexpectedEof),
+            "unexpected error: {error}"
+        );
+
+        let mut body = serialize(&K::CharVector(vec![b'z'; 32])).expect("value should serialize");
+        let declared = u64::try_from(IPC_HEADER_LENGTH + body.len()).expect("length fits u64");
+        let mut response = response_header(0, declared);
+        response.append(&mut body);
+        // A trailing byte of a following frame must survive: the read stops at the declared length.
+        response.push(0xaa);
+        let mut connector = connector_with_response(response);
+        assert_eq!(
+            connector.receive().expect("small frame should deserialize"),
+            K::CharVector(vec![b'z'; 32])
+        );
+    }
+
+    #[test]
+    fn receive_decompresses_a_genuine_compressed_frame() {
+        let body =
+            serialize(&K::CharVector(vec![b'a'; 4096])).expect("test value should serialize");
+        let total_length =
+            u64::try_from(IPC_HEADER_LENGTH + body.len()).expect("test frame length fits u64");
+        let mut frame = response_header(0, total_length);
+        frame.extend_from_slice(&body);
+        let compressed = compress(frame).expect("test frame should compress");
+        assert_eq!(compressed[2], 1, "the test frame must arrive compressed");
+
+        let value = connector_with_response(compressed)
+            .receive()
+            .expect("compressed frame should decompress");
+        assert_eq!(value, K::CharVector(vec![b'a'; 4096]));
     }
 
     #[test]

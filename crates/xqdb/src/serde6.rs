@@ -7,7 +7,7 @@ use polars_arrow::array::{
     Float64Array, Int16Array, Int32Array, Int64Array, ListArray, PrimitiveArray, UInt8Array,
     Utf8ViewArray, View,
 };
-use polars_arrow::bitmap::Bitmap;
+use polars_arrow::bitmap::{Bitmap, MutableBitmap};
 use polars_arrow::datatypes::{ArrowDataType, Field, TimeUnit};
 use polars_arrow::{array::Utf8Array, offset::OffsetsBuffer};
 use polars_buffer::Buffer;
@@ -85,6 +85,54 @@ impl_wire_number!(i64, 8);
 impl_wire_number!(f32, 4);
 impl_wire_number!(f64, 8);
 
+/// Reserves exactly `count` elements up front, reporting allocation failure as a deserialization
+/// error instead of aborting the process. Every caller sizes its allocation from a wire-declared
+/// count multiplied by an element width, so the request can exceed the payload backing it.
+fn try_vec_with_capacity<T>(count: usize, context: &str) -> Result<Vec<T>, XqdbError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|error| {
+        XqdbError::DeserializationErr(format!(
+            "unable to allocate {context} for {count} element(s): {error}"
+        ))
+    })?;
+    Ok(values)
+}
+
+/// Copies a wire payload into an owned buffer with a fallible reservation, so a large frame reports
+/// an allocation failure instead of aborting the process the way `to_vec` does.
+fn try_copy_payload(payload: &[u8], context: &str) -> Result<Vec<u8>, XqdbError> {
+    let mut owned = try_vec_with_capacity::<u8>(payload.len(), context)?;
+    owned.extend_from_slice(payload);
+    Ok(owned)
+}
+
+/// Appends to a buffer whose final size is not known up front, reserving fallibly so growth cannot
+/// abort. `try_reserve` keeps the amortized geometric growth `extend_from_slice` would have used.
+fn try_extend(buffer: &mut Vec<u8>, payload: &[u8], context: &str) -> Result<(), XqdbError> {
+    if buffer.capacity() - buffer.len() < payload.len() {
+        buffer.try_reserve(payload.len()).map_err(|error| {
+            XqdbError::DeserializationErr(format!(
+                "unable to grow {context} by {} byte(s): {error}",
+                payload.len()
+            ))
+        })?;
+    }
+    buffer.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Pushes one element, reserving fallibly when the buffer is full, for the same reason as
+/// `try_extend`: the element count comes from the wire and its total is not known up front.
+fn try_push<T>(values: &mut Vec<T>, value: T, context: &str) -> Result<(), XqdbError> {
+    if values.len() == values.capacity() {
+        values.try_reserve(1).map_err(|error| {
+            XqdbError::DeserializationErr(format!("unable to grow {context}: {error}"))
+        })?;
+    }
+    values.push(value);
+    Ok(())
+}
+
 fn decode_wire_numbers<T: WireNumber>(bytes: &[u8], context: &str) -> Result<Vec<T>, XqdbError> {
     if !bytes.len().is_multiple_of(T::WIDTH) {
         return Err(XqdbError::DeserializationErr(format!(
@@ -125,14 +173,36 @@ fn write_wire_numbers<T: WireNumber>(output: &mut Vec<u8>, values: &[T]) {
     }
 }
 
-/// Packs a validity iterator into a bitmap, returning `None` when every value is valid so
-/// downstream kernels can skip null handling entirely.
-fn optional_validity<I>(validity: I) -> Option<Bitmap>
+/// Packs a bool iterator into an Arrow bitmap over a fallibly reserved byte buffer.
+///
+/// `Bitmap::from_trusted_len_iter` allocates through the infallible allocator, so a column too
+/// large for the machine aborts the host process. Reserving the byte buffer here and handing it to
+/// `MutableBitmap` keeps that allocation fallible while leaving the packing to polars: its aligned
+/// extend calls `Vec::reserve` for exactly `bits.div_ceil(8)` bytes, which this reservation already
+/// satisfies, so it never reaches its own allocator and its word-at-a-time loop is untouched. A
+/// hand-rolled per-bit packer measured 1.5x to 3x slower, which is why the work is delegated.
+fn try_bitmap<I>(bits: I, context: &str) -> Result<Bitmap, XqdbError>
 where
     I: polars_arrow::trusted_len::TrustedLen<Item = bool>,
 {
-    let bitmap = Bitmap::from_trusted_len_iter(validity);
-    (bitmap.unset_bits() != 0).then_some(bitmap)
+    let (lower, upper) = bits.size_hint();
+    let length = upper.unwrap_or(lower);
+    let bytes = try_vec_with_capacity::<u8>(length.div_ceil(8), context)?;
+    let mut bitmap = MutableBitmap::try_new(bytes, 0).map_err(|error| {
+        XqdbError::DeserializationErr(format!("unable to build {context}: {error}"))
+    })?;
+    bitmap.extend_from_trusted_len_iter(bits);
+    Ok(bitmap.into())
+}
+
+/// Packs a validity iterator into a bitmap, returning `None` when every value is valid so
+/// downstream kernels can skip null handling entirely.
+fn optional_validity<I>(validity: I, context: &str) -> Result<Option<Bitmap>, XqdbError>
+where
+    I: polars_arrow::trusted_len::TrustedLen<Item = bool>,
+{
+    let bitmap = try_bitmap(validity, context)?;
+    Ok((bitmap.unset_bits() != 0).then_some(bitmap))
 }
 
 fn q_list_length<T>(length: T) -> Result<[u8; 4], XqdbError>
@@ -585,8 +655,10 @@ fn deserialize_unchecked(
             };
             let symbols = symbols.str().unwrap();
             *pos += 6;
-            let mut k_types = vec![0u8; symbols.len()];
-            let mut vectors: Vec<&[u8]> = Vec::with_capacity(symbols.len());
+            let mut k_types = try_vec_with_capacity::<u8>(symbols.len(), "q table column types")?;
+            k_types.resize(symbols.len(), 0);
+            let mut vectors: Vec<&[u8]> =
+                try_vec_with_capacity(symbols.len(), "q table column payloads")?;
             for k_type in k_types.iter_mut().take(symbols.len()) {
                 *k_type = vec[*pos];
                 *pos += 1;
@@ -826,7 +898,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                     "q boolean list values must be 0 or 1, got {value}"
                 )));
             }
-            let values = Bitmap::from_trusted_len_iter(array_vec.iter().map(|value| *value == 1));
+            let values = try_bitmap(
+                array_vec.iter().map(|value| *value == 1),
+                "q boolean list values",
+            )?;
             array_box = BooleanArray::new(ArrowDataType::Boolean, values, None).boxed();
             series = Series::from_arrow(name.into(), array_box)
                 .map_err(|error| XqdbError::DeserializationErr(error.to_string()))?;
@@ -835,7 +910,7 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         2 => {
             array_box = FixedSizeBinaryArray::new(
                 ArrowDataType::FixedSizeBinary(16),
-                Buffer::from(array_vec.to_vec()),
+                Buffer::from(try_copy_payload(array_vec, "q guid list")?),
                 None,
             )
             .boxed();
@@ -844,7 +919,7 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
             Ok(K::Series(series))
         }
         4 => {
-            array_box = UInt8Array::from_vec(array_vec.to_vec()).boxed();
+            array_box = UInt8Array::from_vec(try_copy_payload(array_vec, "q byte list")?).boxed();
             series = Series::from_arrow(name.into(), array_box)
                 .map_err(|error| XqdbError::DeserializationErr(error.to_string()))?;
             Ok(K::Series(series))
@@ -855,7 +930,8 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                 values
                     .iter()
                     .map(|value| *value > i16::MIN + 1 && *value < i16::MAX),
-            );
+                "q short list validity",
+            )?;
             let mut array = Int16Array::from_vec(values);
             array.set_validity(validity);
             series = Series::from_arrow(name.into(), array.boxed())
@@ -868,7 +944,8 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                 values
                     .iter()
                     .map(|value| *value > i32::MIN + 1 && *value < i32::MAX),
-            );
+                "q int list validity",
+            )?;
             let mut array = Int32Array::from_vec(values);
             array.set_validity(validity);
             series = Series::from_arrow(name.into(), array.boxed())
@@ -881,7 +958,8 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                 values
                     .iter()
                     .map(|value| *value > i64::MIN + 1 && *value < i64::MAX),
-            );
+                "q long list validity",
+            )?;
             let mut array = Int64Array::from_vec(values);
             array.set_validity(validity);
             series = Series::from_arrow(name.into(), array.boxed())
@@ -890,7 +968,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         8 => {
             let values = decode_wire_numbers::<f32>(array_vec, "q real list")?;
-            let validity = optional_validity(values.iter().map(|value| !value.is_nan()));
+            let validity = optional_validity(
+                values.iter().map(|value| !value.is_nan()),
+                "q real list validity",
+            )?;
             let mut array = Float32Array::from_vec(values);
             array.set_validity(validity);
             series = Series::from_arrow(name.into(), array.boxed())
@@ -899,7 +980,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         9 => {
             let values = decode_wire_numbers::<f64>(array_vec, "q float list")?;
-            let validity = optional_validity(values.iter().map(|value| !value.is_nan()));
+            let validity = optional_validity(
+                values.iter().map(|value| !value.is_nan()),
+                "q float list validity",
+            )?;
             let mut array = Float64Array::from_vec(values);
             array.set_validity(validity);
             series = Series::from_arrow(name.into(), array.boxed())
@@ -913,10 +997,13 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                         "q char columns require valid one-byte UTF-8 characters".to_string(),
                     ));
                 }
-                let views: Vec<View> = array_vec
-                    .iter()
-                    .map(|byte| View::new_inline(std::slice::from_ref(byte)))
-                    .collect();
+                let mut views: Vec<View> =
+                    try_vec_with_capacity(array_vec.len(), "q char column views")?;
+                views.extend(
+                    array_vec
+                        .iter()
+                        .map(|byte| View::new_inline(std::slice::from_ref(byte))),
+                );
                 // SAFETY: every view is inline (single ASCII byte, well below the 12-byte
                 // inline limit) and references no data buffers.
                 let array = unsafe {
@@ -933,7 +1020,7 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                     .map_err(|error| XqdbError::DeserializationErr(error.to_string()))?;
                 Ok(K::Series(series))
             } else {
-                Ok(K::CharVector(array_vec.to_vec()))
+                Ok(K::CharVector(try_copy_payload(array_vec, "q char vector")?))
             }
         }
         11 => {
@@ -944,8 +1031,11 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                     "q symbol-list value is not valid UTF-8: {error}"
                 ))
             })?;
-            let mut values = Vec::with_capacity(array_vec.len().saturating_sub(length));
-            let mut offsets = Vec::with_capacity(length + 1);
+            let mut values = try_vec_with_capacity::<u8>(
+                array_vec.len().saturating_sub(length),
+                "q symbol-list values",
+            )?;
+            let mut offsets = try_vec_with_capacity::<i64>(length + 1, "q symbol-list offsets")?;
             offsets.push(0i64);
             let mut cursor = 0usize;
             for _ in 0..length {
@@ -995,7 +1085,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                     *value = unix_timestamp_nanoseconds(*value)?;
                 }
             }
-            let validity = optional_validity(values.iter().map(|value| *value != i64::MIN));
+            let validity = optional_validity(
+                values.iter().map(|value| *value != i64::MIN),
+                "q timestamp list validity",
+            )?;
             let array = PrimitiveArray::new(
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
                 values.into(),
@@ -1007,7 +1100,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         14 => {
             let mut values = decode_wire_numbers::<i32>(array_vec, "q date list")?;
-            let validity = optional_validity(values.iter().map(|value| *value != i32::MIN));
+            let validity = optional_validity(
+                values.iter().map(|value| *value != i32::MIN),
+                "q date list validity",
+            )?;
             for value in values.iter_mut() {
                 if *value != i32::MIN {
                     *value = value.checked_add(10_957).ok_or_else(|| {
@@ -1048,7 +1144,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                     }
                 })
                 .collect::<Result<Vec<_>, XqdbError>>()?;
-            let validity = optional_validity(values.iter().map(|value| *value != i64::MIN));
+            let validity = optional_validity(
+                values.iter().map(|value| *value != i64::MIN),
+                "q datetime list validity",
+            )?;
             let array = PrimitiveArray::new(
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
                 values.into(),
@@ -1060,7 +1159,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         16 => {
             let values = decode_wire_numbers::<i64>(array_vec, "q timespan list")?;
-            let validity = optional_validity(values.iter().map(|value| *value != i64::MIN));
+            let validity = optional_validity(
+                values.iter().map(|value| *value != i64::MIN),
+                "q timespan list validity",
+            )?;
             let array = PrimitiveArray::new(
                 ArrowDataType::Duration(TimeUnit::Nanosecond),
                 values.into(),
@@ -1072,7 +1174,10 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         17..=19 => {
             let q_values = decode_wire_numbers::<i32>(array_vec, "q time list")?;
-            let validity = optional_validity(q_values.iter().map(|value| *value != i32::MIN));
+            let validity = optional_validity(
+                q_values.iter().map(|value| *value != i32::MIN),
+                "q time list validity",
+            )?;
             let multiplier = match k_type {
                 17 => 60_000_000_000,
                 18 => 1_000_000_000,
@@ -1160,7 +1265,7 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
         return Err(XqdbError::NotSupportedKNestedListErr(k_type));
     }
     let name = K_TYPE_NAME[k_type as usize];
-    let mut offsets = Vec::with_capacity(length + 1);
+    let mut offsets = try_vec_with_capacity::<i32>(length + 1, "q nested-list offsets")?;
     offsets.push(0i32);
     let mut values = Vec::new();
     let mut symbol_offsets = if k_type == 11 { Some(vec![0i64]) } else { None };
@@ -1202,10 +1307,11 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
                 .expect("symbol offsets exist for symbol children");
             for _ in 0..sub_length {
                 let symbol = take_utf8_until_nul(vec, &mut pos, "q nested symbol")?;
-                values.extend_from_slice(symbol.as_bytes());
-                child_offsets.push(i64::try_from(values.len()).map_err(|_| {
+                try_extend(&mut values, symbol.as_bytes(), "q nested-symbol values")?;
+                let offset = i64::try_from(values.len()).map_err(|_| {
                     XqdbError::DeserializationErr("q nested-symbol offsets overflowed".to_string())
-                })?);
+                })?;
+                try_push(child_offsets, offset, "q nested-symbol offsets")?;
             }
         } else {
             let payload_length = sub_length
@@ -1223,7 +1329,7 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
                     "q nested-list payload length {payload_length} exceeds the available bytes"
                 ))
             })?;
-            values.extend_from_slice(payload);
+            try_extend(&mut values, payload, "q nested-list values")?;
             pos = end;
         }
     }
@@ -1245,41 +1351,59 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
                     "q nested boolean values must be 0 or 1, got {value}"
                 )));
             }
-            let bits = Bitmap::from_trusted_len_iter(values.iter().map(|value| *value == 1));
+            let bits = try_bitmap(
+                values.iter().map(|value| *value == 1),
+                "q nested boolean values",
+            )?;
             BooleanArray::new(ArrowDataType::Boolean, bits, None).boxed()
         }
         4 => UInt8Array::from_vec(values).boxed(),
         5 => {
             let decoded = decode_wire_numbers::<i16>(&values, "q nested short list")?;
-            let validity = optional_validity(decoded.iter().map(|value| *value != i16::MIN));
+            let validity = optional_validity(
+                decoded.iter().map(|value| *value != i16::MIN),
+                "q nested short list validity",
+            )?;
             let mut array = Int16Array::from_vec(decoded);
             array.set_validity(validity);
             array.boxed()
         }
         6 => {
             let decoded = decode_wire_numbers::<i32>(&values, "q nested int list")?;
-            let validity = optional_validity(decoded.iter().map(|value| *value != i32::MIN));
+            let validity = optional_validity(
+                decoded.iter().map(|value| *value != i32::MIN),
+                "q nested int list validity",
+            )?;
             let mut array = Int32Array::from_vec(decoded);
             array.set_validity(validity);
             array.boxed()
         }
         7 => {
             let decoded = decode_wire_numbers::<i64>(&values, "q nested long list")?;
-            let validity = optional_validity(decoded.iter().map(|value| *value != i64::MIN));
+            let validity = optional_validity(
+                decoded.iter().map(|value| *value != i64::MIN),
+                "q nested long list validity",
+            )?;
             let mut array = Int64Array::from_vec(decoded);
             array.set_validity(validity);
             array.boxed()
         }
         8 => {
             let decoded = decode_wire_numbers::<f32>(&values, "q nested real list")?;
-            let validity = optional_validity(decoded.iter().map(|value| !value.is_nan()));
+            let validity = optional_validity(
+                decoded.iter().map(|value| !value.is_nan()),
+                "q nested real list validity",
+            )?;
             let mut array = Float32Array::from_vec(decoded);
             array.set_validity(validity);
             array.boxed()
         }
         9 => {
             let decoded = decode_wire_numbers::<f64>(&values, "q nested float list")?;
-            let validity = optional_validity(decoded.iter().map(|value| !value.is_nan()));
+            let validity = optional_validity(
+                decoded.iter().map(|value| !value.is_nan()),
+                "q nested float list validity",
+            )?;
             let mut array = Float64Array::from_vec(decoded);
             array.set_validity(validity);
             array.boxed()
@@ -1294,7 +1418,8 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
                 ))
             })?;
             let boundaries = outer_offsets.as_ref();
-            let mut views = Vec::with_capacity(outer_offsets.len_proxy());
+            let mut views =
+                try_vec_with_capacity::<View>(outer_offsets.len_proxy(), "q nested char views")?;
             for window in boundaries.windows(2) {
                 let (start, end) = (window[0] as usize, window[1] as usize);
                 if start < values.len() && values[start] & 0b1100_0000 == 0b1000_0000 {
@@ -1341,7 +1466,10 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
                     *value = unix_timestamp_nanoseconds(*value)?;
                 }
             }
-            let validity = optional_validity(decoded.iter().map(|value| *value != i64::MIN));
+            let validity = optional_validity(
+                decoded.iter().map(|value| *value != i64::MIN),
+                "q nested timestamp list validity",
+            )?;
             PrimitiveArray::new(
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
                 decoded.into(),
@@ -1501,23 +1629,35 @@ fn decompress_unchecked(vec: &[u8], de_vec: &mut [u8], start_pos: usize) {
     }
 }
 
-pub fn compress(vec: Vec<u8>) -> Vec<u8> {
-    if vec.len() < 2000 {
-        vec
+/// Writes the decompressed-length prefix that follows a compressed frame's 8-byte header and
+/// returns the offset where compressed bytes begin. q signals a 4-byte prefix with compression
+/// mode 1 and an 8-byte prefix with mode 2, which is required once the length exceeds `u32::MAX`.
+fn write_decompressed_length_prefix(header: &mut [u8], decompressed_length: usize) -> usize {
+    if decompressed_length > u32::MAX as usize {
+        header[2] = 2;
+        header[8..16].copy_from_slice(&(decompressed_length as u64).to_le_bytes());
+        16
     } else {
-        let mut c_vec = vec![0u8; vec.len() / 2];
+        header[2] = 1;
+        header[8..12].copy_from_slice(&(decompressed_length as u32).to_le_bytes());
+        12
+    }
+}
+
+pub fn compress(vec: Vec<u8>) -> Result<Vec<u8>, XqdbError> {
+    if vec.len() < 2000 {
+        Ok(vec)
+    } else {
+        let scratch_length = vec.len() / 2;
+        let mut c_vec = Vec::new();
+        c_vec.try_reserve_exact(scratch_length).map_err(|error| {
+            XqdbError::Err(format!(
+                "Unable to allocate {scratch_length}-byte IPC compression buffer: {error}"
+            ))
+        })?;
+        c_vec.resize(scratch_length, 0);
         // compressed bytes start position
-        let mut c_pos: usize;
-        if vec.len() > 4294967295 {
-            c_pos = 16;
-            c_vec[2] = 2;
-            c_vec[(3 + 8)..(8 + 8)].copy_from_slice(&vec[3..8]);
-        } else {
-            c_pos = 12;
-            c_vec[2] = 1;
-            // copy raw vec length
-            c_vec[(4 + 4)..(8 + 4)].copy_from_slice(&vec[4..8]);
-        }
+        let mut c_pos: usize = write_decompressed_length_prefix(&mut c_vec, vec.len());
         let mut n_pos: usize = c_pos;
         let mut o_pos: usize = 8;
         let mut x = [0usize; 256];
@@ -1531,7 +1671,7 @@ pub fn compress(vec: Vec<u8>) -> Vec<u8> {
         while o_pos < vec.len() {
             if i == 0 {
                 if c_pos > c_vec.len() - 17 {
-                    return vec;
+                    return Ok(vec);
                 }
                 i = 1;
                 c_vec[n_pos] = n;
@@ -1585,7 +1725,7 @@ pub fn compress(vec: Vec<u8>) -> Vec<u8> {
         c_vec[4..(4 + 4)].copy_from_slice(&c_len);
         c_vec[3] = (c_pos >> 32) as u8;
         c_vec.resize(c_pos, 0u8);
-        c_vec
+        Ok(c_vec)
     }
 }
 
@@ -2304,13 +2444,55 @@ mod tests {
         vec[8] = 1;
         vec[10] = 208;
         vec[11] = 7;
-        let c_vec = compress(vec);
+        let c_vec = compress(vec).expect("test frame should compress");
         let expected_vec: Vec<u8> = [
             1, 1, 1, 0, 36, 0, 0, 0, 222, 7, 0, 0, 192, 1, 0, 208, 7, 0, 0, 0, 255, 0, 255, 63, 0,
             255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 199,
         ]
         .to_vec();
         assert_eq!(c_vec, expected_vec);
+    }
+
+    #[test]
+    fn compressed_length_prefix_matches_the_declared_compression_mode() {
+        // Mode 2 only triggers above u32::MAX, which no test can reach by calling `compress`, so
+        // the prefix writer is exercised directly at both sides of the boundary.
+        let mut header = [0u8; 16];
+        for (decompressed_length, mode, start) in [
+            (2_000usize, 1u8, 12usize),
+            (u32::MAX as usize, 1, 12),
+            (u32::MAX as usize + 1, 2, 16),
+        ] {
+            header.fill(0);
+            assert_eq!(
+                write_decompressed_length_prefix(&mut header, decompressed_length),
+                start
+            );
+            assert_eq!(header[2], mode);
+            let decoded = if mode == 1 {
+                u64::from(u32::from_le_bytes(
+                    header[8..12].try_into().expect("4-byte prefix"),
+                ))
+            } else {
+                u64::from_le_bytes(header[8..16].try_into().expect("8-byte prefix"))
+            };
+            assert_eq!(decoded, decompressed_length as u64);
+        }
+    }
+
+    #[test]
+    fn symbol_list_count_beyond_its_payload_reports_an_allocation_error() {
+        // 11h symbol list declaring 2^31-1 symbols with a two-byte payload: the offsets vector
+        // would need 16 GiB, so the reservation must fail as an error rather than abort.
+        let mut bytes = vec![11u8, 0];
+        bytes.extend_from_slice(&i32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        let error = deserialize(&bytes, &mut 0, false)
+            .expect_err("symbol count beyond the payload must be rejected");
+        assert!(
+            matches!(error, XqdbError::DeserializationErr(_)),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

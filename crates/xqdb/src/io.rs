@@ -7,6 +7,7 @@ use lz4_flex::frame::FrameDecoder;
 use polars::frame::DataFrame;
 use xxhash_rust::xxh32;
 
+use crate::connector::ipc_length_header;
 use crate::errors::XqdbError;
 use crate::serde6;
 use crate::types::{MsgType, K};
@@ -15,28 +16,78 @@ const KXZIP_MAGIC: &[u8; 8] = b"kxzipped";
 const KXZIP_HEADER_LENGTH: usize = 8;
 const KXZIP_FOOTER_WORD_LENGTH: usize = 8;
 const KXZIP_FIXED_FOOTER_WORDS: usize = 5;
-const MAX_J6_BINARY_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const MAX_J6_BINARY_OUTPUT_SIZE: u64 = 512 * 1024 * 1024;
-const MAX_J6_IPC_MESSAGE_SIZE: u64 = 512 * 1024 * 1024;
+/// Upper bound on how far an LZ4 block can expand its input: a match-length continuation byte
+/// costs one input byte and adds 255 output bytes, and the exact supremum `255 * L / (L + 746)`
+/// stays strictly below it. Real kdb+ LZ4 ratios on tabular data are under 30:1, and even an
+/// all-zero column reaches only ~254.96:1, so nothing legitimate is refused.
+const MAX_LZ4_EXPANSION_RATIO: usize = 255;
+/// Bytes reserved before the first read of a file whose reported length is zero, and the floor for
+/// each fallible growth step.
+const INITIAL_FILE_RESERVATION: usize = 64 * 1024;
 
-fn checked_j6_ipc_total_length(body_length: usize) -> Result<(usize, u32), XqdbError> {
+fn checked_j6_ipc_total_length(body_length: usize) -> Result<(usize, u8, u32), XqdbError> {
     let total_length = body_length
         .checked_add(8)
         .ok_or_else(|| XqdbError::Err("J6 IPC message length overflowed".to_string()))?;
-    let total_length_u64 = u64::try_from(total_length).map_err(|_| {
-        XqdbError::Err("J6 IPC message length cannot be represented as u64".to_string())
-    })?;
-    if total_length_u64 > MAX_J6_IPC_MESSAGE_SIZE {
-        return Err(XqdbError::Err(format!(
-            "J6 IPC message length {total_length_u64} exceeds the {MAX_J6_IPC_MESSAGE_SIZE}-byte safety limit"
-        )));
+    let (high_byte, low_length) = ipc_length_header(total_length)?;
+    Ok((total_length, high_byte, low_length))
+}
+
+/// Reads a file whose reported length is only a hint. The reservation starts from that length and
+/// grows fallibly, so a file that gained bytes mid-read, or a regular file that reports zero length
+/// while holding content, still reads completely without an infallible allocation or a size cap.
+fn read_file_fallibly(file: File, hint: usize, description: &str) -> Result<Vec<u8>, XqdbError> {
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    let grow = |buffer: &mut Vec<u8>| -> Result<(), XqdbError> {
+        let target = buffer
+            .capacity()
+            .saturating_mul(2)
+            .max(INITIAL_FILE_RESERVATION);
+        buffer
+            .try_reserve_exact(target - buffer.len())
+            .map_err(|error| {
+                XqdbError::Err(format!(
+                    "Unable to allocate {target}-byte {description} buffer: {error}"
+                ))
+            })
+    };
+    if hint > 0 {
+        buffer.try_reserve_exact(hint).map_err(|error| {
+            XqdbError::Err(format!(
+                "Unable to allocate {hint}-byte {description} buffer: {error}"
+            ))
+        })?;
+    } else {
+        grow(&mut buffer)?;
     }
-    let header_length = u32::try_from(total_length_u64).map_err(|_| {
-        XqdbError::Err(format!(
-            "J6 IPC message length {total_length_u64} cannot be represented in its header"
-        ))
-    })?;
-    Ok((total_length, header_length))
+    loop {
+        let spare = buffer.capacity() - buffer.len();
+        if spare > 0 {
+            let read = (&mut reader)
+                .take(spare as u64)
+                .read_to_end(&mut buffer)
+                .map_err(XqdbError::IOError)?;
+            if read < spare {
+                return Ok(buffer);
+            }
+        }
+        // Capacity is full. Probe a single byte to tell EOF from a longer file, which keeps
+        // `read_to_end` off the infallible growth path it takes when the buffer is full.
+        let mut probe = [0u8; 1];
+        let probed = loop {
+            match reader.read(&mut probe) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(XqdbError::IOError(error)),
+            }
+        };
+        if probed == 0 {
+            return Ok(buffer);
+        }
+        grow(&mut buffer)?;
+        buffer.push(probe[0]);
+    }
 }
 
 fn kxzip_usize(bytes: &[u8], description: &str) -> Result<usize, XqdbError> {
@@ -93,31 +144,12 @@ pub fn read_j6_binary_table(path: &str) -> Result<DataFrame, XqdbError> {
             "Q binary table path is not a regular file: {path}"
         )));
     }
-    if metadata.len() > MAX_J6_BINARY_FILE_SIZE {
-        return Err(XqdbError::Err(format!(
-            "Q binary table file exceeds the {MAX_J6_BINARY_FILE_SIZE}-byte size limit"
-        )));
-    }
     let f = File::open(path).map_err(XqdbError::IOError)?;
 
     let file_length = usize::try_from(metadata.len()).map_err(|_| {
         XqdbError::Err("Q binary table file size cannot be represented on this platform".to_owned())
     })?;
-    let mut buffer = Vec::new();
-    buffer.try_reserve_exact(file_length).map_err(|error| {
-        XqdbError::Err(format!(
-            "Unable to allocate {file_length}-byte Q binary table buffer: {error}"
-        ))
-    })?;
-    let mut reader = BufReader::new(f).take(MAX_J6_BINARY_FILE_SIZE + 1);
-    reader
-        .read_to_end(&mut buffer)
-        .map_err(XqdbError::IOError)?;
-    if buffer.len() as u64 > MAX_J6_BINARY_FILE_SIZE {
-        return Err(XqdbError::Err(format!(
-            "Q binary table file exceeds the {MAX_J6_BINARY_FILE_SIZE}-byte size limit"
-        )));
-    }
+    let mut buffer = read_file_fallibly(f, file_length, "Q binary table")?;
     if buffer.starts_with(KXZIP_MAGIC) {
         buffer = unzip(&buffer)?;
     }
@@ -209,17 +241,6 @@ pub fn unzip_lz4(buf: &[u8], footer_index: usize, block_num: usize) -> Result<Ve
         ));
     }
 
-    let unzipped_size = kxzip_usize(
-        footer
-            .get(8..16)
-            .ok_or_else(|| XqdbError::Err("Kxzip footer is missing output size".to_owned()))?,
-        "decompressed size",
-    )?;
-    if u64::try_from(unzipped_size).unwrap_or(u64::MAX) > MAX_J6_BINARY_OUTPUT_SIZE {
-        return Err(XqdbError::Err(format!(
-            "Kxzip decompressed size exceeds the {MAX_J6_BINARY_OUTPUT_SIZE}-byte safety limit"
-        )));
-    }
     let block_size = kxzip_usize(
         footer
             .get(24..32)
@@ -237,8 +258,15 @@ pub fn unzip_lz4(buf: &[u8], footer_index: usize, block_num: usize) -> Result<Ve
             )))
         }
     };
+    let unzipped_size = kxzip_usize(
+        footer
+            .get(8..16)
+            .ok_or_else(|| XqdbError::Err("Kxzip footer is missing output size".to_owned()))?,
+        "decompressed size",
+    )?;
 
     let mut frame_capacity = 19usize;
+    let mut reachable_unzipped_size = 0usize;
     let mut block_start = KXZIP_HEADER_LENGTH;
     for block_index in 0..block_num {
         let size = usize::try_from(lz4_block_size(footer, block_index)?).map_err(|_| {
@@ -258,12 +286,26 @@ pub fn unzip_lz4(buf: &[u8], footer_index: usize, block_num: usize) -> Result<Ve
             .checked_add(4)
             .and_then(|capacity| capacity.checked_add(size))
             .ok_or_else(|| XqdbError::Err("Kxzip LZ4 frame size overflowed".to_owned()))?;
+        // A block decodes to at most `block_size` bytes and to at most 255x its own compressed
+        // bytes, so the tighter of the two, summed over the blocks actually present, bounds the
+        // output. Unlike a block-count product this cannot be inflated by footer metadata alone.
+        reachable_unzipped_size = size
+            .checked_mul(MAX_LZ4_EXPANSION_RATIO)
+            .map(|expanded| expanded.min(block_size))
+            .and_then(|expanded| reachable_unzipped_size.checked_add(expanded))
+            .ok_or_else(|| XqdbError::Err("Kxzip output size bound overflowed".to_owned()))?;
         block_start = block_end;
     }
     if block_start != footer_index {
         return Err(XqdbError::Err(format!(
             "Kxzip data contains {} trailing compressed bytes",
             footer_index - block_start
+        )));
+    }
+    if unzipped_size > reachable_unzipped_size {
+        return Err(XqdbError::Err(format!(
+            "Kxzip declares {unzipped_size} decompressed bytes, unreachable from its {} compressed bytes, which expand to at most {reachable_unzipped_size}",
+            footer_index - KXZIP_HEADER_LENGTH
         )));
     }
 
@@ -329,15 +371,15 @@ pub fn generate_j6_ipc_msg(
     k: K,
 ) -> Result<Vec<u8>, XqdbError> {
     let body_length = k.j6_len()?;
-    let (total_length, header_length) = checked_j6_ipc_total_length(body_length)?;
+    let (total_length, high_byte, low_length) = checked_j6_ipc_total_length(body_length)?;
     let mut vec = Vec::new();
     vec.try_reserve_exact(total_length).map_err(|error| {
         XqdbError::Err(format!(
             "Unable to allocate {total_length}-byte J6 IPC message: {error}"
         ))
     })?;
-    vec.extend_from_slice(&[1, msg_type as u8, 0, 0]);
-    vec.extend_from_slice(&header_length.to_le_bytes());
+    vec.extend_from_slice(&[1, msg_type as u8, 0, high_byte]);
+    vec.extend_from_slice(&low_length.to_le_bytes());
     serde6::serialize_into(&k, &mut vec)?;
     if vec.len() != total_length {
         return Err(XqdbError::Err(
@@ -345,7 +387,7 @@ pub fn generate_j6_ipc_msg(
         ));
     }
     if enable_compression {
-        Ok(serde6::compress(vec))
+        serde6::compress(vec)
     } else {
         Ok(vec)
     }
@@ -365,7 +407,7 @@ mod tests {
     };
     use polars_arrow::array::Utf8Array;
 
-    use super::{checked_j6_ipc_total_length, MAX_J6_IPC_MESSAGE_SIZE};
+    use super::{checked_j6_ipc_total_length, MAX_LZ4_EXPANSION_RATIO};
     use crate::{
         io,
         serde6::{deserialize, serialize},
@@ -425,12 +467,18 @@ mod tests {
     }
 
     #[test]
-    fn generate_ipc_helper_rejects_oversized_lengths_before_header_conversion() {
-        let maximum_body =
-            usize::try_from(MAX_J6_IPC_MESSAGE_SIZE).expect("512 MiB fits usize") - 8;
-        let (_, header_length) =
+    fn generate_ipc_helper_is_bounded_only_by_the_q_length_field() {
+        let maximum_body = ((1usize << 40) - 1) - 8;
+        let (total_length, high_byte, low_length) =
             checked_j6_ipc_total_length(maximum_body).expect("limit-sized helper frame");
-        assert_eq!(u64::from(header_length), MAX_J6_IPC_MESSAGE_SIZE);
+        assert_eq!(total_length, (1usize << 40) - 1);
+        assert_eq!(high_byte, 0xff);
+        assert_eq!(low_length, u32::MAX);
+        // A body above 4 GiB is framed through the 40-bit form rather than refused.
+        let (_, high_byte, low_length) =
+            checked_j6_ipc_total_length(4 * 1024 * 1024 * 1024).expect("body above u32::MAX");
+        assert_eq!(high_byte, 1);
+        assert_eq!(low_length, 8);
         assert!(checked_j6_ipc_total_length(maximum_body + 1).is_err());
         assert!(checked_j6_ipc_total_length(usize::MAX).is_err());
     }
@@ -473,10 +521,45 @@ mod tests {
     }
 
     #[test]
-    fn unzip_rejects_oversized_output() {
-        let bytes = one_block_kxzip(&[0], 1, u64::MAX);
-        let error = io::unzip(&bytes).expect_err("oversized Kxzip output should fail");
-        assert!(error.to_string().contains("safety limit"));
+    fn unzip_rejects_output_unreachable_from_its_compressed_bytes() {
+        // One compressed byte can expand to at most 255, so both an absurd claim and a merely
+        // over-optimistic one are rejected before the output buffer is allocated.
+        for declared in [u64::MAX, 65_537, MAX_LZ4_EXPANSION_RATIO as u64 + 1] {
+            let bytes = one_block_kxzip(&[0], 1, declared);
+            let error = io::unzip(&bytes).expect_err("over-claimed Kxzip output should fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("unreachable from its 1 compressed bytes")
+                    && message.contains("at most 255"),
+                "unexpected error for {declared}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unzip_rejects_a_footer_inflated_output_claim() {
+        // A crafted footer buys 4 MiB of permitted claim for every 8 bytes of block metadata, so a
+        // block-count product is no bound at all: 1024 zero-length blocks in an 8,240-byte file
+        // would otherwise admit a 4 GiB zero-filled allocation.
+        let block_num = 1024usize;
+        let mut bytes = b"kxzipped".to_vec();
+        let mut footer = vec![0u8; (block_num + 5) * 8];
+        footer[4] = 4;
+        footer[8..16].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+        footer[16..24].copy_from_slice(&8u64.to_le_bytes());
+        footer[24..32].copy_from_slice(&4_194_304u64.to_le_bytes());
+        let block_count_start = footer.len() - 8;
+        footer[block_count_start..].copy_from_slice(&(block_num as u64).to_le_bytes());
+        bytes.extend_from_slice(&footer);
+        assert_eq!(bytes.len(), 8240);
+
+        let error = io::unzip(&bytes).expect_err("footer-inflated claim should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("unreachable from its 0 compressed bytes")
+                && message.contains("at most 0"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
