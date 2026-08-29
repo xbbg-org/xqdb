@@ -1,4 +1,5 @@
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Timelike};
+use indexmap::IndexMap;
 use polars::datatypes::{DataType as PolarsDataType, TimeUnit as PolarTimeUnit};
 use polars::prelude::{Categories, DataFrame};
 use polars::series::Series;
@@ -95,6 +96,29 @@ fn try_vec_with_capacity<T>(count: usize, context: &str) -> Result<Vec<T>, XqdbE
             "unable to allocate {context} for {count} element(s): {error}"
         ))
     })?;
+    Ok(values)
+}
+
+/// Collects a fallible iterator of known length into a fallibly reserved vector. `collect` would
+/// size its allocation from the same wire-declared count through the aborting allocator.
+fn try_collect<T, I>(iterator: I, context: &str) -> Result<Vec<T>, XqdbError>
+where
+    I: ExactSizeIterator<Item = Result<T, XqdbError>>,
+{
+    let mut values = try_vec_with_capacity::<T>(iterator.len(), context)?;
+    for value in iterator {
+        values.push(value?);
+    }
+    Ok(values)
+}
+
+/// Collects an infallible iterator of known length into a fallibly reserved vector.
+fn try_collect_infallible<T, I>(iterator: I, context: &str) -> Result<Vec<T>, XqdbError>
+where
+    I: ExactSizeIterator<Item = T>,
+{
+    let mut values = try_vec_with_capacity::<T>(iterator.len(), context)?;
+    values.extend(iterator);
     Ok(values)
 }
 
@@ -621,19 +645,33 @@ fn deserialize_unchecked(
                 }
                 let key_values = keys.iter_str().map(|key| key.unwrap_or("").to_owned());
                 let values = match values {
-                    K::Series(series) => series
-                        .iter()
-                        .map(K::try_from_any_value)
-                        .collect::<Result<Vec<_>, XqdbError>>()?,
+                    K::Series(series) => {
+                        let mut decoded =
+                            try_vec_with_capacity::<K>(series.len(), "q dictionary values")?;
+                        for value in series.iter() {
+                            decoded.push(K::try_from_any_value(value)?);
+                        }
+                        decoded
+                    }
                     K::MixedList(values) => values,
-                    K::CharVector(values) => values.into_iter().map(K::Char).collect(),
+                    K::CharVector(values) => try_collect_infallible(
+                        values.into_iter().map(K::Char),
+                        "q dictionary char values",
+                    )?,
                     _ => {
                         return Err(XqdbError::DeserializationErr(
                             "dictionary values changed type during decoding".to_string(),
                         ))
                     }
                 };
-                Ok(K::Dict(key_values.zip(values).collect()))
+                let mut dict = IndexMap::new();
+                dict.try_reserve_exact(value_length).map_err(|error| {
+                    XqdbError::DeserializationErr(format!(
+                        "unable to allocate q dictionary with {value_length} entries: {error}"
+                    ))
+                })?;
+                dict.extend(key_values.zip(values));
+                Ok(K::Dict(dict))
             } else {
                 Err(XqdbError::Err(format!(
                     "Only support symbol keys dictionary or keyed table, got k type {:?}",
@@ -667,11 +705,17 @@ fn deserialize_unchecked(
                 *pos = end_pos;
             }
 
-            let mut columns: Vec<Series> = vectors
+            let mut decoded: Vec<Result<Series, XqdbError>> =
+                try_vec_with_capacity(vectors.len(), "q table column results")?;
+            vectors
                 .par_iter()
-                .zip(k_types.clone())
+                .zip(k_types.par_iter().copied())
                 .map(|(values, k_type)| deserialize_series(values, k_type, true)?.try_into())
-                .collect::<Result<Vec<_>, XqdbError>>()?;
+                .collect_into_vec(&mut decoded);
+            let mut columns = try_vec_with_capacity::<Series>(decoded.len(), "q table columns")?;
+            for column in decoded {
+                columns.push(column?);
+            }
             columns.iter_mut().zip(symbols.iter()).for_each(|(c, n)| {
                 c.rename(n.unwrap_or("").into());
             });
@@ -1120,30 +1164,28 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         15 => {
             let q_values = decode_wire_numbers::<f64>(array_vec, "q datetime list")?;
-            let values = q_values
-                .into_iter()
-                .map(|value| {
-                    if value.is_nan() {
-                        Ok(i64::MIN)
-                    } else if value == f64::INFINITY {
-                        Ok(i64::MAX)
-                    } else if value == f64::NEG_INFINITY {
-                        Ok(i64::MIN + 1)
-                    } else {
-                        let q_milliseconds =
-                            finite_f64_to_i64((value * MS_PER_DAY).round(), "finite q datetime")?;
-                        q_milliseconds
-                            .checked_mul(1_000_000)
-                            .and_then(|value| value.checked_add(NANOS_DIFF))
-                            .ok_or_else(|| {
-                                XqdbError::DeserializationErr(
-                                    "finite q datetime is outside the Unix nanosecond range"
-                                        .to_string(),
-                                )
-                            })
-                    }
-                })
-                .collect::<Result<Vec<_>, XqdbError>>()?;
+            let values = q_values.into_iter().map(|value| {
+                if value.is_nan() {
+                    Ok(i64::MIN)
+                } else if value == f64::INFINITY {
+                    Ok(i64::MAX)
+                } else if value == f64::NEG_INFINITY {
+                    Ok(i64::MIN + 1)
+                } else {
+                    let q_milliseconds =
+                        finite_f64_to_i64((value * MS_PER_DAY).round(), "finite q datetime")?;
+                    q_milliseconds
+                        .checked_mul(1_000_000)
+                        .and_then(|value| value.checked_add(NANOS_DIFF))
+                        .ok_or_else(|| {
+                            XqdbError::DeserializationErr(
+                                "finite q datetime is outside the Unix nanosecond range"
+                                    .to_string(),
+                            )
+                        })
+                }
+            });
+            let values = try_collect(values, "q datetime list")?;
             let validity = optional_validity(
                 values.iter().map(|value| *value != i64::MIN),
                 "q datetime list validity",
@@ -1184,23 +1226,21 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
                 19 => 1_000_000,
                 _ => unreachable!(),
             };
-            let values = q_values
-                .into_iter()
-                .map(|value| {
-                    if value == i32::MIN {
-                        Ok(0)
-                    } else {
-                        i64::from(value)
-                            .checked_mul(multiplier)
-                            .filter(|value| (0..NANOS_PER_DAY).contains(value))
-                            .ok_or_else(|| {
-                                XqdbError::DeserializationErr(
-                                    "q time-list value exceeds one day".to_string(),
-                                )
-                            })
-                    }
-                })
-                .collect::<Result<Vec<_>, XqdbError>>()?;
+            let values = q_values.into_iter().map(|value| {
+                if value == i32::MIN {
+                    Ok(0)
+                } else {
+                    i64::from(value)
+                        .checked_mul(multiplier)
+                        .filter(|value| (0..NANOS_PER_DAY).contains(value))
+                        .ok_or_else(|| {
+                            XqdbError::DeserializationErr(
+                                "q time-list value exceeds one day".to_string(),
+                            )
+                        })
+                }
+            });
+            let values = try_collect(values, "q time list")?;
             let array = PrimitiveArray::new(
                 ArrowDataType::Time64(TimeUnit::Nanosecond),
                 values.into(),
