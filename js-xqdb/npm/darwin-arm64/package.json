@@ -1,6 +1,6 @@
 {
   "name": "@xbbg/xqdb-darwin-arm64",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "macOS arm64 native addon for xqdb",
   "author": "XQDB contributors",
   "main": "xqdb.darwin-arm64.node",

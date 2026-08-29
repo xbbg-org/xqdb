@@ -46,8 +46,8 @@ const K_TYPE_NAME: [&str; 20] = [
 use crate::{
     errors::XqdbError,
     types::{
-        validate_guid_series, validate_q_symbol, validate_q_time_series, QLambda, QOperator, K,
-        K_TYPE_SIZE, MAX_VALUE_DEPTH,
+        try_own_str, validate_guid_series, validate_q_symbol, validate_q_time_series, QLambda,
+        QOperator, K, K_TYPE_SIZE, MAX_VALUE_DEPTH,
     },
 };
 
@@ -472,9 +472,10 @@ fn deserialize_unchecked(
                 "q float atom",
             )?))),
             246 => Ok(K::Char(take_bytes::<1>(vec, pos, "q char atom")?[0])),
-            245 => Ok(K::Symbol(
-                take_utf8_until_nul(vec, pos, "q symbol atom")?.to_owned(),
-            )),
+            245 => Ok(K::Symbol(try_own_str(
+                take_utf8_until_nul(vec, pos, "q symbol atom")?,
+                "q symbol atom",
+            )?)),
             // timestamp
             244 => {
                 let q_ns = i64::from_le_bytes(take_bytes::<8>(vec, pos, "q timestamp atom")?);
@@ -643,7 +644,7 @@ fn deserialize_unchecked(
                         keys.len()
                     )));
                 }
-                let key_values = keys.iter_str().map(|key| key.unwrap_or("").to_owned());
+                let keys = keys.iter_str();
                 let values = match values {
                     K::Series(series) => {
                         let mut decoded =
@@ -670,7 +671,9 @@ fn deserialize_unchecked(
                         "unable to allocate q dictionary with {value_length} entries: {error}"
                     ))
                 })?;
-                dict.extend(key_values.zip(values));
+                for (key, value) in keys.zip(values) {
+                    dict.insert(try_own_str(key.unwrap_or(""), "q dictionary key")?, value);
+                }
                 Ok(K::Dict(dict))
             } else {
                 Err(XqdbError::Err(format!(
@@ -719,7 +722,9 @@ fn deserialize_unchecked(
             columns.iter_mut().zip(symbols.iter()).for_each(|(c, n)| {
                 c.rename(n.unwrap_or("").into());
             });
-            DataFrame::new_infer_height(columns.into_iter().map(|c| c.into()).collect())
+            let mut frame_columns = try_vec_with_capacity(columns.len(), "q table frame columns")?;
+            frame_columns.extend(columns.into_iter().map(|column| column.into()));
+            DataFrame::new_infer_height(frame_columns)
                 .map(K::DataFrame)
                 .map_err(|error| XqdbError::DeserializationErr(error.to_string()))
         }

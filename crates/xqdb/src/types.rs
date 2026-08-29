@@ -189,6 +189,21 @@ pub enum K {
     Null,
 }
 
+/// Copies a string with a fallible reservation, so a wire-sized element count cannot abort the
+/// process the way `to_owned` does. Each value is small on its own, but a list decodes one per
+/// element and the aggregate scales with the payload.
+pub(crate) fn try_own_str(text: &str, context: &str) -> Result<String, XqdbError> {
+    let mut owned = String::new();
+    owned.try_reserve_exact(text.len()).map_err(|error| {
+        XqdbError::DeserializationErr(format!(
+            "unable to allocate {context} of {} byte(s): {error}",
+            text.len()
+        ))
+    })?;
+    owned.push_str(text);
+    Ok(owned)
+}
+
 impl K {
     pub fn j6_len(&self) -> Result<usize, XqdbError> {
         self.j6_len_with_depth(0)
@@ -327,8 +342,8 @@ impl K {
         Ok(match a {
             AnyValue::Null => K::Null,
             AnyValue::Boolean(b) => K::Boolean(b),
-            AnyValue::String(s) => K::String(s.to_owned()),
-            AnyValue::StringOwned(s) => K::String(s.to_string()),
+            AnyValue::String(s) => K::String(try_own_str(s, "q string value")?),
+            AnyValue::StringOwned(s) => K::String(try_own_str(s.as_str(), "q string value")?),
             AnyValue::UInt8(v) => K::U8(v),
             AnyValue::Int16(v) => K::I16(v),
             AnyValue::Int32(v) => K::I32(v),
