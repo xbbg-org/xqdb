@@ -343,7 +343,7 @@ jobs:
     if: needs.source.outputs.publish == 'true' && github.repository == 'xbbg-org/xqdb'
     needs: [source, assemble]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment:
       name: npm
       url: https://www.npmjs.com/package/@xbbg/xqdb
@@ -435,15 +435,18 @@ jobs:
               "@xbbg/xqdb-linux-x64-gnu@$VERSION" \
               "@xbbg/xqdb-darwin-arm64@$VERSION"
           }
-          for attempt in 1 2 3 4 5; do
+          # The registry can take several minutes to serve a fresh version: the 0.1.5 and
+          # 0.1.7 publishes both succeeded yet failed this check inside a 100-second window,
+          # each needing a manual rerun to reach the GitHub Release job.
+          for attempt in $(seq 1 10); do
             if install_published; then
               break
             fi
-            if [[ "$attempt" -eq 5 ]]; then
+            if [[ "$attempt" -eq 10 ]]; then
               echo "Published packages did not become readable." >&2
               exit 1
             fi
-            sleep "$(( attempt * 10 ))"
+            sleep 30
           done
 
           audit_report="$verify_dir/signatures.json"
@@ -479,15 +482,15 @@ jobs:
           }
           NODE
           }
-          for attempt in 1 2 3 4 5; do
+          for attempt in $(seq 1 10); do
             if verify_provenance; then
               break
             fi
-            if [[ "$attempt" -eq 5 ]]; then
+            if [[ "$attempt" -eq 10 ]]; then
               echo "Published provenance did not become verifiable." >&2
               exit 1
             fi
-            sleep "$(( attempt * 10 ))"
+            sleep 30
           done
           node --input-type=module -e 'const { serializeAsIpcBytes6 } = await import("@xbbg/xqdb"); const bytes = await serializeAsIpcBytes6("sync", false, 42); if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error("published package returned no bytes");'
   github-release:

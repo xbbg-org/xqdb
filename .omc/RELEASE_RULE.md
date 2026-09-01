@@ -89,6 +89,17 @@ gh api -X POST "repos/xbbg-org/xqdb/actions/runs/$run_id/pending_deployments" \
 The `github-release` job in each workflow runs only after its publish job, so an
 unapproved run also leaves no GitHub Release and no attached artifacts.
 
+### Post-publish verification can lag the registry
+
+`publish` verifies the packages by installing them from the registry after
+publishing. The 0.1.5 and 0.1.7 publishes both succeeded yet failed that check
+because the registry had not propagated within the original 100-second window;
+the window is now ten 30-second attempts. If it still fails after a successful
+publish, `gh run rerun <run_id> --failed` is safe: `publish_if_missing` compares
+the tarball integrity against the registry and skips any byte-identical version,
+so the rerun only repeats the verification and then runs `github-release`. The
+rerun waits for the `npm` environment approval again.
+
 ## Test Gate
 
 From `.github/workflows/Quality.yml`:
