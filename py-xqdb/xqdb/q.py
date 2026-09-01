@@ -27,6 +27,7 @@ class Q(object):
         retries: int = 0,
         timeout: int = 0,
         backend: str = "pyarrow",
+        symbol_encoding: str = "strict",
     ):
         if (not host) or host == socket.gethostname():
             host = "127.0.0.1"
@@ -36,6 +37,7 @@ class Q(object):
         self.retries = retries
         self.backend = backend
         self.q = XqdbConnector(host, port, user, passwd, enable_tls, timeout, 6)
+        self.symbol_encoding = symbol_encoding
 
     @property
     def backend(self) -> str:
@@ -44,6 +46,16 @@ class Q(object):
     @backend.setter
     def backend(self, backend: str) -> None:
         self._backend = validate_backend(backend)
+
+    @property
+    def symbol_encoding(self) -> str:
+        """How q text that is not valid UTF-8 is decoded: ``"strict"`` fails the
+        response, ``"lossy"`` replaces each invalid sequence with U+FFFD."""
+        return self.q.symbol_encoding
+
+    @symbol_encoding.setter
+    def symbol_encoding(self, symbol_encoding: str) -> None:
+        self.q.symbol_encoding = symbol_encoding
 
     def connect(self):
         self.q.connect()

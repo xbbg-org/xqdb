@@ -5,7 +5,7 @@ use napi::{JsString, JsValue, ValueType};
 use napi_derive::napi;
 use std::mem::size_of;
 use uuid::Uuid;
-use xqdb::types::{QLambda, QOperator, K, MIN_Q_TIMESTAMP_UNIX_NANOS};
+use xqdb::types::{QLambda, QOperator, SymbolEncoding, K, MIN_Q_TIMESTAMP_UNIX_NANOS};
 
 use crate::arrow::{dataframe_from_ipc, dataframe_to_ipc, series_from_ipc, series_to_ipc};
 use crate::error::BindingError;
@@ -44,6 +44,17 @@ pub struct NativeOptions {
     pub password: Option<String>,
     pub tls: Option<bool>,
     pub timeout_seconds: Option<u32>,
+    pub symbol_encoding: Option<String>,
+}
+
+/// Parses the `symbolEncoding` option shared by `NativeConnector` and `readBinary6`; absent
+/// means strict, so invalid UTF-8 is only ever transcoded on request.
+pub(crate) fn parse_symbol_encoding(value: Option<&str>) -> Result<SymbolEncoding, String> {
+    match value {
+        None => Ok(SymbolEncoding::Strict),
+        Some(name) => SymbolEncoding::from_name(name)
+            .ok_or_else(|| format!("symbolEncoding must be \"strict\" or \"lossy\", got {name:?}")),
+    }
 }
 
 #[napi(object)]

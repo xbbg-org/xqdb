@@ -20,6 +20,40 @@ pub enum MsgType {
     Response = 2,
 }
 
+/// How wire text that is not valid UTF-8 is decoded: q symbols, char and string columns, lambda
+/// source and context. q stores text as raw bytes and never validates it, while Arrow string
+/// columns and Rust strings must be valid UTF-8, so a response carrying stray Latin-1 or binary
+/// bytes has to be either refused or transcoded.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymbolEncoding {
+    /// Fail the whole response on the first invalid byte sequence.
+    #[default]
+    Strict,
+    /// Replace each maximal invalid subsequence with U+FFFD REPLACEMENT CHARACTER, the same
+    /// substitution `String::from_utf8_lossy` performs, so every other value in the response
+    /// survives intact.
+    Lossy,
+}
+
+impl SymbolEncoding {
+    /// The option value each binding accepts for this policy.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Lossy => "lossy",
+        }
+    }
+
+    /// Parses a binding option value; `None` for anything other than `strict` or `lossy`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "strict" => Some(Self::Strict),
+            "lossy" => Some(Self::Lossy),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) const Q_UNARY_PRIMITIVES: [&str; 42] = [
     "", "+:", "-:", "*:", "%:", "&:", "|:", "^:", "=:", "<:", ">:", "$:", ",:", "#:", "_:", "~:",
     "!:", "?:", "@:", ".:", "0::", "1::", "2::", "avg", "last", "sum", "prd", "min", "max", "exit",

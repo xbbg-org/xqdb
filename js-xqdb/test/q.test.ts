@@ -81,6 +81,19 @@ describe("Q native delegation", () => {
     ).toThrowError(RangeError);
   });
 
+  it("passes symbolEncoding to the native connector only when set", async () => {
+    await new Q({ host: "localhost", port: 1800 }).connect();
+    await new Q({ host: "localhost", port: 1800, symbolEncoding: "lossy" }).connect();
+
+    expect(connectorOptions).toEqual([
+      { host: "localhost", port: 1800, timeoutSeconds: 30 },
+      { host: "localhost", port: 1800, timeoutSeconds: 30, symbolEncoding: "lossy" },
+    ]);
+    expect(
+      () => new Q({ host: "localhost", port: 1800, symbolEncoding: "latin1" as never }),
+    ).toThrowError(RangeError);
+  });
+
   it("delegates calls in invocation order without waiting for an earlier response", async () => {
     let resolveSync: ((result: NativeResult) => void) | undefined;
     syncResultPromise = new Promise((resolve) => {

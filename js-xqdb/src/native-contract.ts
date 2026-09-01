@@ -5,6 +5,7 @@ export interface NativeOptions {
   readonly password?: string;
   readonly tls?: boolean;
   readonly timeoutSeconds?: number;
+  readonly symbolEncoding?: string;
 }
 
 export interface NativeEntry {
@@ -49,7 +50,7 @@ export interface NativeConnectorConstructor {
 
 export interface NativeModule {
   readonly NativeConnector: NativeConnectorConstructor;
-  readBinary6(path: string): Promise<NativeResult>;
+  readBinary6(path: string, symbolEncoding?: string): Promise<NativeResult>;
   serializeAsIpcBytes6(
     messageType: "async" | "sync" | "response",
     compress: boolean,

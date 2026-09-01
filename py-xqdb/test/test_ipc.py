@@ -759,6 +759,48 @@ def test_unsupported_backend_assignment_does_not_fallback(q):
     assert q.sync("1+1") == 2
 
 
+def test_unsupported_symbol_encoding_raises_at_construction_and_assignment():
+    with pytest.raises(ValueError, match="symbol_encoding must be 'strict' or 'lossy'"):
+        Q("does-not-exist.invalid", 1800, symbol_encoding="latin1")
+
+    q = Q("does-not-exist.invalid", 1800)
+    assert q.symbol_encoding == "strict"
+    q.symbol_encoding = "lossy"
+    assert q.symbol_encoding == "lossy"
+    with pytest.raises(ValueError, match="symbol_encoding must be 'strict' or 'lossy'"):
+        q.symbol_encoding = "Lossy"
+    assert q.symbol_encoding == "lossy"
+
+
+# A q table `([] s:enlist `$"caf\351"; t:enlist "caf\351")` as J6 bytes: the symbol and the
+# string both carry the Latin-1 byte 0xE9, which is not valid UTF-8.
+_NON_UTF8_TABLE = bytes(
+    [98, 0, 99, 11, 0, 2, 0, 0, 0]
+    + list(b"s\0t\0")
+    + [0, 0, 2, 0, 0, 0]
+    + [11, 0, 1, 0, 0, 0]
+    + list(b"caf\xe9\0")
+    + [0, 0, 1, 0, 0, 0, 10, 0, 4, 0, 0, 0]
+    + list(b"caf\xe9")
+)
+
+
+def test_read_binary6_symbol_encoding_controls_invalid_utf8(tmp_path):
+    path = tmp_path / "latin1.bin"
+    path.write_bytes(b"\xff\x01" + _NON_UTF8_TABLE)
+
+    with pytest.raises(XqdbError, match="not valid UTF-8"):
+        read_binary6(str(path))
+    with pytest.raises(XqdbError, match="not valid UTF-8"):
+        read_binary6(str(path), symbol_encoding="strict")
+    with pytest.raises(ValueError, match="symbol_encoding must be 'strict' or 'lossy'"):
+        read_binary6(str(path), symbol_encoding="latin1")
+
+    table = _native_table(read_binary6(str(path), symbol_encoding="lossy"))
+    assert table.column("s").to_pylist() == ["caf\ufffd"]
+    assert table.column("t").to_pylist() == ["caf\ufffd"]
+
+
 def test_lazy_inputs_are_rejected_before_ipc(q):
     import polars as pl
 

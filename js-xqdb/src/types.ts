@@ -2,6 +2,13 @@ import type { Table, Vector } from "apache-arrow";
 import type { Buffer } from "node:buffer";
 import { conversionError } from "./errors.js";
 
+/**
+ * How q text that is not valid UTF-8 is decoded. q stores symbols and strings as raw bytes, so a
+ * result carrying stray Latin-1 or binary bytes is either refused as a whole (`"strict"`, the
+ * default) or transcoded with each invalid sequence replaced by U+FFFD (`"lossy"`).
+ */
+export type XqdbSymbolEncoding = "strict" | "lossy";
+
 export interface QOptions {
   readonly host: string;
   readonly port: number;
@@ -12,6 +19,21 @@ export interface QOptions {
   readonly timeout?: number;
   /** Additional connection attempts after the first failed IO attempt. */
   readonly retries?: number;
+  /** Decoding policy for symbols and strings that are not valid UTF-8; defaults to `"strict"`. */
+  readonly symbolEncoding?: XqdbSymbolEncoding;
+}
+
+export function validatedSymbolEncoding(
+  value: unknown,
+  owner: string,
+): XqdbSymbolEncoding | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "strict" || value === "lossy") {
+    return value;
+  }
+  throw new RangeError(`${owner}.symbolEncoding must be "strict" or "lossy"`);
 }
 
 export type XqdbMessageType = "async" | "sync" | "response";

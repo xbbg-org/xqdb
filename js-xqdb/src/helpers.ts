@@ -5,7 +5,13 @@ import { normalizeInput, unwrapNativeValue } from "./conversion.js";
 import { conversionError, XqdbError, rejectionToIOError } from "./errors.js";
 import { loadNativeBinding } from "./native-loader.js";
 import type { NativeModule, NativeResult } from "./native-contract.js";
-import type { XqdbInput, XqdbMessageType } from "./types.js";
+import { validatedSymbolEncoding } from "./types.js";
+import type { XqdbInput, XqdbMessageType, XqdbSymbolEncoding } from "./types.js";
+
+export interface ReadBinary6Options {
+  /** Decoding policy for symbols and strings that are not valid UTF-8; defaults to `"strict"`. */
+  readonly symbolEncoding?: XqdbSymbolEncoding;
+}
 
 async function invokeNativeHelper(
   operation: (binding: NativeModule) => Promise<NativeResult>,
@@ -21,8 +27,12 @@ async function invokeNativeHelper(
   }
 }
 
-export async function readBinary6(path: string): Promise<Table> {
-  const result = await invokeNativeHelper((binding) => binding.readBinary6(path));
+export async function readBinary6(
+  path: string,
+  options: ReadBinary6Options = {},
+): Promise<Table> {
+  const symbolEncoding = validatedSymbolEncoding(options.symbolEncoding, "ReadBinary6Options");
+  const result = await invokeNativeHelper((binding) => binding.readBinary6(path, symbolEncoding));
   const value = unwrapNativeValue(result);
   if (!(value instanceof Table)) {
     throw conversionError("readBinary6 returned a native value that was not a table");

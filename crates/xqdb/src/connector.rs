@@ -1,6 +1,6 @@
 use crate::errors::XqdbError;
 use crate::serde6::{compress, decompress, deserialize, serialize_into};
-use crate::types::{MsgType, K};
+use crate::types::{MsgType, SymbolEncoding, K};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, StreamOwned};
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -81,6 +81,7 @@ pub struct Connector {
     pub user: String,
     pub password: String,
     pub timeout: Duration,
+    pub symbol_encoding: SymbolEncoding,
     stream: Option<Box<dyn QStream + Send + Sync>>,
     abort_handle: ConnectorAbortHandle,
 }
@@ -346,6 +347,7 @@ impl Connector {
             is_local,
             timeout: Duration::new(timeout, 0),
             version,
+            symbol_encoding: SymbolEncoding::Strict,
         }
     }
 
@@ -478,6 +480,7 @@ impl Connector {
     }
 
     pub fn receive(&mut self) -> Result<K, XqdbError> {
+        let symbol_encoding = self.symbol_encoding;
         if self.version <= 6 {
             if let Some(stream) = &mut self.stream {
                 let mut header = [0u8; IPC_HEADER_LENGTH];
@@ -568,9 +571,9 @@ impl Connector {
                         self.shutdown()?;
                         return Err(error);
                     }
-                    deserialize(&decompressed, &mut 0, false)
+                    deserialize(&decompressed, &mut 0, symbol_encoding)
                 } else {
-                    deserialize(&vec, &mut 0, false)
+                    deserialize(&vec, &mut 0, symbol_encoding)
                 }
             } else {
                 Err(XqdbError::NotConnectedErr())
@@ -940,6 +943,29 @@ mod tests {
             .receive()
             .expect("compressed frame should decompress");
         assert_eq!(value, K::CharVector(vec![b'a'; 4096]));
+    }
+
+    #[test]
+    fn receive_applies_the_connector_symbol_encoding() {
+        let body = [245, b'c', b'a', b'f', 0xe9, 0];
+        let total_length =
+            u64::try_from(IPC_HEADER_LENGTH + body.len()).expect("test frame length fits u64");
+        let mut frame = response_header(0, total_length);
+        frame.extend_from_slice(&body);
+
+        let mut strict = connector_with_response(frame.clone());
+        assert_eq!(strict.symbol_encoding, SymbolEncoding::Strict);
+        assert!(matches!(
+            strict.receive(),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+
+        let mut lossy = connector_with_response(frame);
+        lossy.symbol_encoding = SymbolEncoding::Lossy;
+        assert_eq!(
+            lossy.receive().expect("lossy symbol atom should decode"),
+            K::Symbol("caf\u{FFFD}".to_string())
+        );
     }
 
     #[test]

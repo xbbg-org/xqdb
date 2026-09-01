@@ -13,6 +13,7 @@ use polars_arrow::datatypes::{ArrowDataType, Field, TimeUnit};
 use polars_arrow::{array::Utf8Array, offset::OffsetsBuffer};
 use polars_buffer::Buffer;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use std::borrow::Cow;
 use std::cmp::min;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use uuid::Uuid;
@@ -47,9 +48,12 @@ use crate::{
     errors::XqdbError,
     types::{
         try_own_str, validate_guid_series, validate_q_symbol, validate_q_time_series, QLambda,
-        QOperator, K, K_TYPE_SIZE, MAX_VALUE_DEPTH,
+        QOperator, SymbolEncoding, K, K_TYPE_SIZE, MAX_VALUE_DEPTH,
     },
 };
+
+/// U+FFFD REPLACEMENT CHARACTER, substituted for invalid UTF-8 under `SymbolEncoding::Lossy`.
+const REPLACEMENT_CHARACTER: &str = "\u{FFFD}";
 
 fn downcast_array<'a, T: 'static>(
     array: &'a dyn Array,
@@ -276,11 +280,68 @@ fn take_bytes<const N: usize>(
         .expect("slice length was checked against the array width"))
 }
 
-fn take_utf8_until_nul<'a>(
+/// Decodes wire text under `encoding`: valid UTF-8 is borrowed as is, anything else is an error
+/// under `Strict` and transcoded under `Lossy`.
+fn decode_utf8<'a>(
+    bytes: &'a [u8],
+    encoding: SymbolEncoding,
+    context: &str,
+) -> Result<Cow<'a, str>, XqdbError> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(Cow::Borrowed(text)),
+        Err(error) => match encoding {
+            SymbolEncoding::Strict => Err(XqdbError::DeserializationErr(format!(
+                "{context} is not valid UTF-8: {error}"
+            ))),
+            SymbolEncoding::Lossy => transcode_utf8_lossy(bytes, context).map(Cow::Owned),
+        },
+    }
+}
+
+/// Replaces each maximal invalid subsequence of `bytes` with U+FFFD, producing the same text as
+/// `String::from_utf8_lossy`. The output is reserved fallibly because the input length comes from
+/// the wire; sizing it exactly costs a second validation pass, which only runs on invalid input.
+fn transcode_utf8_lossy(bytes: &[u8], context: &str) -> Result<String, XqdbError> {
+    let transcoded_length = bytes.utf8_chunks().fold(0usize, |length, chunk| {
+        let replacement = if chunk.invalid().is_empty() {
+            0
+        } else {
+            REPLACEMENT_CHARACTER.len()
+        };
+        length
+            .saturating_add(chunk.valid().len())
+            .saturating_add(replacement)
+    });
+    let mut text = String::new();
+    text.try_reserve_exact(transcoded_length).map_err(|error| {
+        XqdbError::DeserializationErr(format!(
+            "unable to allocate {context} of {transcoded_length} transcoded byte(s): {error}"
+        ))
+    })?;
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            text.push_str(REPLACEMENT_CHARACTER);
+        }
+    }
+    Ok(text)
+}
+
+/// Owns decoded text, keeping the buffer `Lossy` transcoding already produced.
+fn try_own_decoded(text: Cow<'_, str>, context: &str) -> Result<String, XqdbError> {
+    match text {
+        Cow::Borrowed(text) => try_own_str(text, context),
+        Cow::Owned(text) => Ok(text),
+    }
+}
+
+/// Advances past one NUL-terminated wire string and returns its bytes without decoding them, for
+/// passes that only measure a payload and leave text decoding to the pass that materializes it.
+fn take_until_nul<'a>(
     bytes: &'a [u8],
     pos: &mut usize,
     context: &str,
-) -> Result<&'a str, XqdbError> {
+) -> Result<&'a [u8], XqdbError> {
     let tail = bytes.get(*pos..).ok_or_else(|| {
         XqdbError::DeserializationErr(format!("{context} starts beyond the available payload"))
     })?;
@@ -289,13 +350,20 @@ fn take_utf8_until_nul<'a>(
     let end = pos
         .checked_add(length)
         .ok_or_else(|| XqdbError::DeserializationErr(format!("{context} length overflowed")))?;
-    let value = std::str::from_utf8(&bytes[*pos..end]).map_err(|error| {
-        XqdbError::DeserializationErr(format!("{context} is not valid UTF-8: {error}"))
-    })?;
+    let value = &bytes[*pos..end];
     *pos = end.checked_add(1).ok_or_else(|| {
         XqdbError::DeserializationErr(format!("{context} terminator offset overflowed"))
     })?;
     Ok(value)
+}
+
+fn take_utf8_until_nul<'a>(
+    bytes: &'a [u8],
+    pos: &mut usize,
+    encoding: SymbolEncoding,
+    context: &str,
+) -> Result<Cow<'a, str>, XqdbError> {
+    decode_utf8(take_until_nul(bytes, pos, context)?, encoding, context)
 }
 
 fn take_list_length(bytes: &[u8], pos: &mut usize, context: &str) -> Result<usize, XqdbError> {
@@ -339,7 +407,12 @@ fn q_datetime_nanoseconds(q_days: f64) -> Result<i64, XqdbError> {
             )
         })
 }
-fn deserialize_lambda(vec: &[u8], pos: &mut usize, start_pos: usize) -> Result<K, XqdbError> {
+fn deserialize_lambda(
+    vec: &[u8],
+    pos: &mut usize,
+    start_pos: usize,
+    encoding: SymbolEncoding,
+) -> Result<K, XqdbError> {
     let context_tail = vec
         .get(start_pos..)
         .ok_or_else(|| XqdbError::DeserializationErr("q lambda omitted its context".to_string()))?;
@@ -349,9 +422,7 @@ fn deserialize_lambda(vec: &[u8], pos: &mut usize, start_pos: usize) -> Result<K
     let context_end = start_pos
         .checked_add(context_length)
         .ok_or_else(|| XqdbError::DeserializationErr("q lambda context overflowed".to_string()))?;
-    let context = std::str::from_utf8(&vec[start_pos..context_end]).map_err(|error| {
-        XqdbError::DeserializationErr(format!("q lambda context is not valid UTF-8: {error}"))
-    })?;
+    let context = decode_utf8(&vec[start_pos..context_end], encoding, "q lambda context")?;
     let vector_start = context_end.checked_add(1).ok_or_else(|| {
         XqdbError::DeserializationErr("q lambda source offset overflowed".to_string())
     })?;
@@ -382,23 +453,24 @@ fn deserialize_lambda(vec: &[u8], pos: &mut usize, start_pos: usize) -> Result<K
     let source_end = vector_end.checked_add(source_length).ok_or_else(|| {
         XqdbError::DeserializationErr("q lambda source length overflowed".to_string())
     })?;
-    let source = std::str::from_utf8(vec.get(vector_end..source_end).ok_or_else(|| {
-        XqdbError::DeserializationErr(format!(
-            "q lambda source length {source_length} exceeds the available payload"
-        ))
-    })?)
-    .map_err(|error| {
-        XqdbError::DeserializationErr(format!("q lambda source is not valid UTF-8: {error}"))
-    })?;
+    let source = decode_utf8(
+        vec.get(vector_end..source_end).ok_or_else(|| {
+            XqdbError::DeserializationErr(format!(
+                "q lambda source length {source_length} exceeds the available payload"
+            ))
+        })?,
+        encoding,
+        "q lambda source",
+    )?;
     let lambda = QLambda::with_context(source, context)
         .map_err(|error| XqdbError::DeserializationErr(error.to_string()))?;
     *pos = source_end;
     Ok(K::Lambda(lambda))
 }
 
-pub fn deserialize(vec: &[u8], pos: &mut usize, is_column: bool) -> Result<K, XqdbError> {
+pub fn deserialize(vec: &[u8], pos: &mut usize, encoding: SymbolEncoding) -> Result<K, XqdbError> {
     match catch_unwind(AssertUnwindSafe(|| {
-        deserialize_unchecked(vec, pos, is_column, 0)
+        deserialize_unchecked(vec, pos, false, encoding, 0)
     })) {
         Ok(Ok(value)) if *pos == vec.len() => Ok(value),
         Ok(Ok(_)) => Err(XqdbError::DeserializationErr(format!(
@@ -416,6 +488,7 @@ fn deserialize_unchecked(
     vec: &[u8],
     pos: &mut usize,
     is_column: bool,
+    encoding: SymbolEncoding,
     depth: usize,
 ) -> Result<K, XqdbError> {
     if depth > MAX_VALUE_DEPTH {
@@ -472,8 +545,8 @@ fn deserialize_unchecked(
                 "q float atom",
             )?))),
             246 => Ok(K::Char(take_bytes::<1>(vec, pos, "q char atom")?[0])),
-            245 => Ok(K::Symbol(try_own_str(
-                take_utf8_until_nul(vec, pos, "q symbol atom")?,
+            245 => Ok(K::Symbol(try_own_decoded(
+                take_utf8_until_nul(vec, pos, encoding, "q symbol atom")?,
                 "q symbol atom",
             )?)),
             // timestamp
@@ -587,7 +660,7 @@ fn deserialize_unchecked(
                             ))
                         })?;
                         for _ in 0..length {
-                            res.push(deserialize_unchecked(vec, pos, false, depth + 1)?);
+                            res.push(deserialize_unchecked(vec, pos, false, encoding, depth + 1)?);
                         }
                         return Ok(K::MixedList(res));
                     } else {
@@ -597,18 +670,14 @@ fn deserialize_unchecked(
             };
             let start_pos = *pos;
             *pos = end_pos;
-            if k_type == 10 {
-                deserialize_series(&vec[start_pos..end_pos], k_type, false)
-            } else {
-                deserialize_series(&vec[start_pos..end_pos], k_type, true)
-            }
+            deserialize_series(&vec[start_pos..end_pos], k_type, k_type != 10, encoding)
         }
         99 => {
             if vec[*pos] == 98 {
                 let mut key_df: DataFrame =
-                    deserialize_unchecked(vec, pos, true, depth + 1)?.try_into()?;
+                    deserialize_unchecked(vec, pos, true, encoding, depth + 1)?.try_into()?;
                 let value_df: DataFrame =
-                    deserialize_unchecked(vec, pos, true, depth + 1)?.try_into()?;
+                    deserialize_unchecked(vec, pos, true, encoding, depth + 1)?.try_into()?;
                 key_df = key_df
                     .hstack(value_df.columns())
                     .map_err(|e| XqdbError::Err(e.to_string()))?;
@@ -616,7 +685,8 @@ fn deserialize_unchecked(
             } else if vec[*pos] == 11 {
                 *pos += 1;
                 let end_pos = calculate_array_end_index(vec, *pos, 11)?;
-                let keys: Series = deserialize_series(&vec[*pos..end_pos], 11, true)?.try_into()?;
+                let keys: Series =
+                    deserialize_series(&vec[*pos..end_pos], 11, true, encoding)?.try_into()?;
                 *pos = end_pos;
                 if vec[end_pos] > 19 {
                     return Err(XqdbError::Err(format!(
@@ -624,7 +694,7 @@ fn deserialize_unchecked(
                         vec[end_pos]
                     )));
                 }
-                let values = deserialize_unchecked(vec, pos, is_column, depth + 1)?;
+                let values = deserialize_unchecked(vec, pos, is_column, encoding, depth + 1)?;
                 let keys = keys
                     .cat32()
                     .map_err(|error| XqdbError::DeserializationErr(error.to_string()))?;
@@ -685,7 +755,7 @@ fn deserialize_unchecked(
         98 => {
             *pos += 3;
             let end_pos = calculate_array_end_index(vec, *pos, 11)?;
-            let k = deserialize_series(&vec[*pos..end_pos], 11, false)?;
+            let k = deserialize_series(&vec[*pos..end_pos], 11, false, encoding)?;
             *pos = end_pos;
             let symbols = if let K::Series(series) = k {
                 series
@@ -713,7 +783,9 @@ fn deserialize_unchecked(
             vectors
                 .par_iter()
                 .zip(k_types.par_iter().copied())
-                .map(|(values, k_type)| deserialize_series(values, k_type, true)?.try_into())
+                .map(|(values, k_type)| {
+                    deserialize_series(values, k_type, true, encoding)?.try_into()
+                })
                 .collect_into_vec(&mut decoded);
             let mut columns = try_vec_with_capacity::<Series>(decoded.len(), "q table columns")?;
             for column in decoded {
@@ -728,7 +800,7 @@ fn deserialize_unchecked(
                 .map(K::DataFrame)
                 .map_err(|error| XqdbError::DeserializationErr(error.to_string()))
         }
-        100 => deserialize_lambda(vec, pos, start_pos),
+        100 => deserialize_lambda(vec, pos, start_pos, encoding),
         101..=103 => {
             let opcode = *vec.get(start_pos).ok_or_else(|| {
                 XqdbError::DeserializationErr(format!(
@@ -746,8 +818,10 @@ fn deserialize_unchecked(
         }
         // q error
         128 => {
-            let message = take_utf8_until_nul(vec, pos, "q error message")?;
-            Err(XqdbError::ServerErr(message.to_owned()))
+            // The message is diagnostic text rather than data, so surfacing the server's error
+            // with replacement characters beats hiding it behind a decoding failure.
+            let message = take_utf8_until_nul(vec, pos, SymbolEncoding::Lossy, "q error message")?;
+            Err(XqdbError::ServerErr(message.into_owned()))
         }
         _ => Err(XqdbError::NotSupportedKTypeErr(k_type)),
     }
@@ -844,7 +918,7 @@ fn calculate_array_end_index(vec: &[u8], start_pos: usize, k_type: u8) -> Result
 
                 if current_k_type == 11 {
                     for _ in 0..sub_length {
-                        take_utf8_until_nul(vec, &mut pos, "q nested symbol")?;
+                        take_until_nul(vec, &mut pos, "q nested symbol")?;
                     }
                 } else {
                     let payload_length = sub_length
@@ -872,7 +946,7 @@ fn calculate_array_end_index(vec: &[u8], start_pos: usize, k_type: u8) -> Result
         11 => {
             let length = take_list_length(vec, &mut pos, "q symbol list")?;
             for _ in 0..length {
-                take_utf8_until_nul(vec, &mut pos, "q symbol-list value")?;
+                take_until_nul(vec, &mut pos, "q symbol-list value")?;
             }
             Ok(pos)
         }
@@ -899,7 +973,12 @@ fn calculate_array_end_index(vec: &[u8], start_pos: usize, k_type: u8) -> Result
     }
 }
 
-fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, XqdbError> {
+fn deserialize_series(
+    vec: &[u8],
+    k_type: u8,
+    as_column: bool,
+    encoding: SymbolEncoding,
+) -> Result<K, XqdbError> {
     if k_type as usize >= K_TYPE_SIZE.len() {
         return Err(XqdbError::NotSupportedKListErr(k_type));
     }
@@ -940,7 +1019,7 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
     let array_box: Box<dyn Array>;
     let mut series: Series;
     match k_type {
-        0 => deserialize_nested_array(vec),
+        0 => deserialize_nested_array(vec, encoding),
         1 => {
             if let Some(value) = array_vec.iter().find(|value| **value > 1) {
                 return Err(XqdbError::DeserializationErr(format!(
@@ -1041,27 +1120,41 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
         }
         10 => {
             if as_column {
-                if !array_vec.is_ascii() {
+                let mut views: Vec<View> =
+                    try_vec_with_capacity(array_vec.len(), "q char column views")?;
+                let total_bytes_len = if array_vec.is_ascii() {
+                    views.extend(
+                        array_vec
+                            .iter()
+                            .map(|byte| View::new_inline(std::slice::from_ref(byte))),
+                    );
+                    array_vec.len()
+                } else if encoding == SymbolEncoding::Lossy {
+                    // A char column holds one byte per row, so a byte outside ASCII is an
+                    // invalid sequence on its own and every such row becomes U+FFFD.
+                    views.extend(array_vec.iter().map(|byte| {
+                        if byte.is_ascii() {
+                            View::new_inline(std::slice::from_ref(byte))
+                        } else {
+                            View::new_inline(REPLACEMENT_CHARACTER.as_bytes())
+                        }
+                    }));
+                    let replaced = array_vec.iter().filter(|byte| !byte.is_ascii()).count();
+                    array_vec.len() + replaced * (REPLACEMENT_CHARACTER.len() - 1)
+                } else {
                     return Err(XqdbError::DeserializationErr(
                         "q char columns require valid one-byte UTF-8 characters".to_string(),
                     ));
-                }
-                let mut views: Vec<View> =
-                    try_vec_with_capacity(array_vec.len(), "q char column views")?;
-                views.extend(
-                    array_vec
-                        .iter()
-                        .map(|byte| View::new_inline(std::slice::from_ref(byte))),
-                );
-                // SAFETY: every view is inline (single ASCII byte, well below the 12-byte
-                // inline limit) and references no data buffers.
+                };
+                // SAFETY: every view is inline (a single ASCII byte or the three-byte U+FFFD,
+                // well below the 12-byte inline limit) and references no data buffers.
                 let array = unsafe {
                     Utf8ViewArray::new_unchecked(
                         ArrowDataType::Utf8View,
                         views.into(),
                         Buffer::default(),
                         None,
-                        Some(array_vec.len()),
+                        Some(total_bytes_len),
                         0,
                     )
                 };
@@ -1073,13 +1166,11 @@ fn deserialize_series(vec: &[u8], k_type: u8, as_column: bool) -> Result<K, Xqdb
             }
         }
         11 => {
-            // NUL is a one-byte UTF-8 code point, so validating the whole payload once also
-            // proves every NUL-delimited symbol is valid UTF-8.
-            std::str::from_utf8(array_vec).map_err(|error| {
-                XqdbError::DeserializationErr(format!(
-                    "q symbol-list value is not valid UTF-8: {error}"
-                ))
-            })?;
+            // NUL is a one-byte UTF-8 code point, so decoding the whole payload once proves every
+            // NUL-delimited symbol is valid UTF-8; lossy transcoding replaces only invalid
+            // subsequences, so every terminator survives into the transcoded bytes.
+            let text = decode_utf8(array_vec, encoding, "q symbol-list value")?;
+            let array_vec = text.as_bytes();
             let mut values = try_vec_with_capacity::<u8>(
                 array_vec.len().saturating_sub(length),
                 "q symbol-list values",
@@ -1290,7 +1381,48 @@ fn new_empty_series(k_type: u8) -> Result<K, XqdbError> {
     Ok(K::Series(series))
 }
 
-fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
+/// Checks that every row of a nested char list is valid UTF-8. A row is valid exactly when the
+/// concatenated payload is valid and every row boundary lands on a code-point start, because
+/// UTF-8 is self-synchronizing, so one validation covers every row.
+fn validate_nested_char(values: &[u8], boundaries: &[i32]) -> Result<(), XqdbError> {
+    std::str::from_utf8(values).map_err(|error| {
+        XqdbError::DeserializationErr(format!("q nested char value is not valid UTF-8: {error}"))
+    })?;
+    for window in boundaries.windows(2) {
+        let start = window[0] as usize;
+        if start < values.len() && values[start] & 0b1100_0000 == 0b1000_0000 {
+            return Err(XqdbError::DeserializationErr(
+                "q nested char value is not valid UTF-8: row boundary splits a code point"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Transcodes each row of a nested char list on its own, so a code point split across two rows
+/// becomes a replacement character in both instead of validating as a whole.
+fn transcode_nested_char_lossy(
+    values: &[u8],
+    boundaries: &[i32],
+) -> Result<(Vec<u8>, Vec<i32>), XqdbError> {
+    let mut transcoded = try_vec_with_capacity::<u8>(values.len(), "q nested char values")?;
+    let mut offsets = try_vec_with_capacity::<i32>(boundaries.len(), "q nested char offsets")?;
+    offsets.push(0i32);
+    for window in boundaries.windows(2) {
+        let row = &values[window[0] as usize..window[1] as usize];
+        let row = decode_utf8(row, SymbolEncoding::Lossy, "q nested char value")?;
+        try_extend(&mut transcoded, row.as_bytes(), "q nested char values")?;
+        offsets.push(i32::try_from(transcoded.len()).map_err(|_| {
+            XqdbError::DeserializationErr(
+                "q nested char values exceed i32::MAX bytes after transcoding".to_string(),
+            )
+        })?);
+    }
+    Ok((transcoded, offsets))
+}
+
+fn deserialize_nested_array(vec: &[u8], encoding: SymbolEncoding) -> Result<K, XqdbError> {
     let mut pos = 0;
     let length = take_list_length(vec, &mut pos, "q nested list")?;
     if length == 0 {
@@ -1351,7 +1483,7 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
                 .as_mut()
                 .expect("symbol offsets exist for symbol children");
             for _ in 0..sub_length {
-                let symbol = take_utf8_until_nul(vec, &mut pos, "q nested symbol")?;
+                let symbol = take_utf8_until_nul(vec, &mut pos, encoding, "q nested symbol")?;
                 try_extend(&mut values, symbol.as_bytes(), "q nested-symbol values")?;
                 let offset = i64::try_from(values.len()).map_err(|_| {
                     XqdbError::DeserializationErr("q nested-symbol offsets overflowed".to_string())
@@ -1454,31 +1586,25 @@ fn deserialize_nested_array(vec: &[u8]) -> Result<K, XqdbError> {
             array.boxed()
         }
         10 => {
-            // Validate the concatenated payload once; a row is valid UTF-8 exactly when the
-            // whole buffer is valid and every row boundary lands on a code-point start
-            // (UTF-8 is self-synchronizing).
-            std::str::from_utf8(&values).map_err(|error| {
-                XqdbError::DeserializationErr(format!(
-                    "q nested char value is not valid UTF-8: {error}"
-                ))
-            })?;
             let boundaries = outer_offsets.as_ref();
+            let (values, boundaries) = match validate_nested_char(&values, boundaries) {
+                Ok(()) => (values, Cow::Borrowed(boundaries)),
+                Err(error) if encoding == SymbolEncoding::Strict => return Err(error),
+                Err(_) => {
+                    let (values, boundaries) = transcode_nested_char_lossy(&values, boundaries)?;
+                    (values, Cow::Owned(boundaries))
+                }
+            };
             let mut views =
                 try_vec_with_capacity::<View>(outer_offsets.len_proxy(), "q nested char views")?;
             for window in boundaries.windows(2) {
                 let (start, end) = (window[0] as usize, window[1] as usize);
-                if start < values.len() && values[start] & 0b1100_0000 == 0b1000_0000 {
-                    return Err(XqdbError::DeserializationErr(
-                        "q nested char value is not valid UTF-8: row boundary splits a code point"
-                            .to_string(),
-                    ));
-                }
                 views.push(View::new_from_bytes(&values[start..end], 0, start as u32));
             }
             let total_bytes_len = values.len();
             // SAFETY: views were derived from monotonic in-range offsets over the single
-            // data buffer registered below, and the payload was UTF-8 validated above with
-            // every row boundary checked to sit on a code-point start.
+            // data buffer registered below, and every row was either validated as UTF-8 with
+            // its boundary on a code-point start or transcoded to valid UTF-8 on its own.
             unsafe {
                 Utf8ViewArray::new_unchecked(
                     ArrowDataType::Utf8View,
@@ -2456,7 +2582,7 @@ mod tests {
     #[test]
     fn malformed_atom_panics_are_contained_as_deserialization_errors() {
         assert!(matches!(
-            deserialize(&[254, 0], &mut 0, false),
+            deserialize(&[254, 0], &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
     }
@@ -2464,7 +2590,11 @@ mod tests {
     #[test]
     fn mixed_list_count_cannot_amplify_a_tiny_frame() {
         assert!(matches!(
-            deserialize(&[0, 0, 0xff, 0xff, 0xff, 0xff, 101, 0], &mut 0, false),
+            deserialize(
+                &[0, 0, 0xff, 0xff, 0xff, 0xff, 101, 0],
+                &mut 0,
+                SymbolEncoding::Strict
+            ),
             Err(XqdbError::DeserializationErr(_))
         ));
     }
@@ -2532,7 +2662,7 @@ mod tests {
         let mut bytes = vec![11u8, 0];
         bytes.extend_from_slice(&i32::MAX.to_le_bytes());
         bytes.extend_from_slice(&[0, 0]);
-        let error = deserialize(&bytes, &mut 0, false)
+        let error = deserialize(&bytes, &mut 0, SymbolEncoding::Strict)
             .expect_err("symbol count beyond the payload must be rejected");
         assert!(
             matches!(error, XqdbError::DeserializationErr(_)),
@@ -2543,7 +2673,7 @@ mod tests {
     #[test]
     fn deserialize_and_serialize_boolean_list() {
         let vec = [1, 0, 2, 0, 0, 0, 1, 0].to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2562,7 +2692,7 @@ mod tests {
             242, 64, 77, 90, 236, 247, 200, 171, 186, 226, 136,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let binary_array = FixedSizeBinaryArray::new(
             ArrowDataType::FixedSizeBinary(16),
@@ -2584,7 +2714,7 @@ mod tests {
     #[test]
     fn deserialize_and_serialize_byte_list() {
         let vec = [4, 0, 2, 0, 0, 0, 0, 1].to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect =
             Series::from_arrow(name.into(), UInt8Array::from([Some(0), Some(1)]).boxed()).unwrap();
@@ -2596,7 +2726,7 @@ mod tests {
     #[test]
     fn deserialize_and_serialize_short_list() {
         let vec = [5, 0, 4, 0, 0, 0, 0, 128, 1, 128, 0, 0, 255, 127].to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2615,7 +2745,7 @@ mod tests {
             6, 0, 4, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 128, 0, 0, 0, 0, 255, 255, 255, 127,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2638,7 +2768,7 @@ mod tests {
             0, 0, 255, 255, 255, 255, 255, 255, 255, 127,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2661,7 +2791,7 @@ mod tests {
             8, 0, 4, 0, 0, 0, 0, 0, 192, 127, 0, 0, 128, 255, 0, 0, 0, 0, 0, 0, 128, 127,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2686,7 +2816,7 @@ mod tests {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 127,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2707,13 +2837,13 @@ mod tests {
     #[test]
     fn deserialize_and_serialize_char_vector_losslessly() {
         let vec = [10, 0, 4, 0, 0, 0, 0, 127, 128, 255].to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         assert_eq!(k, K::CharVector(vec![0, 127, 128, 255]));
         assert_eq!(serialize(&k).unwrap(), vec);
 
         let empty = [10, 0, 0, 0, 0, 0].to_vec();
         assert_eq!(
-            deserialize(&empty, &mut 0, false).unwrap(),
+            deserialize(&empty, &mut 0, SymbolEncoding::Strict).unwrap(),
             K::CharVector(Vec::new())
         );
     }
@@ -2721,7 +2851,7 @@ mod tests {
     #[test]
     fn deserialize_and_serialize_symbol_list() {
         let vec = [11, 0, 3, 0, 0, 0, 97, 0, 0, 97, 98, 99, 0].to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2749,7 +2879,7 @@ mod tests {
             97, 98, 99,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[6] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2768,7 +2898,7 @@ mod tests {
             199, 153, 133, 126, 114, 10,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2791,7 +2921,7 @@ mod tests {
             14, 0, 3, 0, 0, 0, 9, 34, 0, 0, 0, 0, 0, 128, 220, 210, 169, 5,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2815,7 +2945,7 @@ mod tests {
             27, 195, 4, 193, 64, 0, 0, 0, 0, 0, 0, 240, 127,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2838,7 +2968,7 @@ mod tests {
             0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 127,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2861,7 +2991,7 @@ mod tests {
             17, 0, 4, 0, 0, 0, 0, 0, 0, 128, 242, 2, 0, 0, 0, 0, 0, 0, 159, 5, 0, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2889,7 +3019,7 @@ mod tests {
             18, 0, 4, 0, 0, 0, 0, 0, 0, 128, 240, 176, 0, 0, 0, 0, 0, 0, 127, 81, 1, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2917,7 +3047,7 @@ mod tests {
             19, 0, 4, 0, 0, 0, 0, 0, 0, 128, 149, 44, 179, 2, 0, 0, 0, 0, 255, 91, 38, 5,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let name = K_TYPE_NAME[vec[0] as usize];
         let expect = Series::from_arrow(
             name.into(),
@@ -2941,7 +3071,7 @@ mod tests {
             1,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 1, 3, 6].to_vec()).unwrap();
@@ -2970,7 +3100,7 @@ mod tests {
             0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let array = BooleanArray::from([true, false, true, false, true, false].map(Some));
@@ -2997,7 +3127,7 @@ mod tests {
             0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 4, 0, 1, 0, 0, 0, 1, 4, 0, 2, 0, 0, 0, 1, 2,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3026,7 +3156,7 @@ mod tests {
             2, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3055,7 +3185,7 @@ mod tests {
             1, 0, 0, 0, 2, 0, 0, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3084,7 +3214,7 @@ mod tests {
             2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3113,7 +3243,7 @@ mod tests {
             0, 0, 128, 63, 0, 0, 128, 255,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3143,7 +3273,7 @@ mod tests {
             2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 240, 255,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3172,7 +3302,7 @@ mod tests {
             2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let k_type = vec[6];
         let name = K_TYPE_NAME[k_type as usize];
         let offsets = OffsetsBuffer::<i32>::try_from([0, 0, 1, 3].to_vec()).unwrap();
@@ -3201,7 +3331,7 @@ mod tests {
             0, 0, 0, 1, 0, 0, 0, 7, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let expect = K::MixedList(vec![
             K::Symbol("upd".to_owned()),
             K::Symbol("t".to_owned()),
@@ -3221,7 +3351,7 @@ mod tests {
             0, 0, 0, 0, 0, 0, 9, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let df: DataFrame = k.try_into().unwrap();
         let s0 = Series::new("a".into(), [1i64].as_ref());
         let s1 = Series::new("b".into(), [1.0f64].as_ref());
@@ -3238,7 +3368,7 @@ mod tests {
             0, 0, 0, 0, 0, 0, 0, 240, 63,
         ]
         .to_vec();
-        let k = deserialize(&vec, &mut 0, false).unwrap();
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap();
         let df: DataFrame = k.try_into().unwrap();
         let s0 = Series::new("a".into(), [1i64].as_ref());
         let s1 = Series::new("b".into(), [1.0f64].as_ref());
@@ -3352,7 +3482,7 @@ mod tests {
         assert_eq!(plus.try_get_j_type_code().unwrap(), 102);
         assert_eq!(serialize(&plus).unwrap(), [102, 1]);
         assert_eq!(
-            deserialize(&[102, 1], &mut 0, false).unwrap(),
+            deserialize(&[102, 1], &mut 0, SymbolEncoding::Strict).unwrap(),
             K::Operator(QOperator::PLUS)
         );
 
@@ -3373,7 +3503,7 @@ mod tests {
                 );
                 assert_eq!(serialize(&K::Operator(operator)).unwrap(), bytes);
                 assert_eq!(
-                    deserialize(&bytes, &mut 0, false).unwrap(),
+                    deserialize(&bytes, &mut 0, SymbolEncoding::Strict).unwrap(),
                     K::Operator(operator)
                 );
             }
@@ -3385,17 +3515,20 @@ mod tests {
         assert!(QOperator::new("::").is_err());
         assert!(QOperator::new("plus").is_err());
         assert!(QOperator::new("+\0").is_err());
-        assert_eq!(deserialize(&[101, 0], &mut 0, false).unwrap(), K::Null);
+        assert_eq!(
+            deserialize(&[101, 0], &mut 0, SymbolEncoding::Strict).unwrap(),
+            K::Null
+        );
 
         for bytes in [[101, 42], [102, 34], [103, 3]] {
             assert!(matches!(
-                deserialize(&bytes, &mut 0, false),
+                deserialize(&bytes, &mut 0, SymbolEncoding::Strict),
                 Err(XqdbError::NotSupportedKOperatorErr(_))
             ));
         }
         for k_type in 104..=112 {
             assert!(matches!(
-                deserialize(&[k_type, 0], &mut 0, false),
+                deserialize(&[k_type, 0], &mut 0, SymbolEncoding::Strict),
                 Err(XqdbError::NotSupportedKTypeErr(value)) if value == k_type
             ));
         }
@@ -3410,7 +3543,7 @@ mod tests {
         assert_eq!(K::Lambda(root.clone()).try_get_j_type_code().unwrap(), 100);
         let mut root_pos = 0;
         assert_eq!(
-            deserialize(&root_bytes, &mut root_pos, false).unwrap(),
+            deserialize(&root_bytes, &mut root_pos, SymbolEncoding::Strict).unwrap(),
             K::Lambda(root)
         );
         assert_eq!(root_pos, root_bytes.len());
@@ -3428,7 +3561,7 @@ mod tests {
             contextual_bytes
         );
         assert_eq!(
-            deserialize(&contextual_bytes, &mut 0, false).unwrap(),
+            deserialize(&contextual_bytes, &mut 0, SymbolEncoding::Strict).unwrap(),
             K::Lambda(contextual.clone())
         );
         assert_eq!(
@@ -3439,7 +3572,7 @@ mod tests {
         let k_dialect = QLambda::new(" k){x+y} ").unwrap();
         let k_dialect_bytes = serialize(&K::Lambda(k_dialect.clone())).unwrap();
         assert_eq!(
-            deserialize(&k_dialect_bytes, &mut 0, false).unwrap(),
+            deserialize(&k_dialect_bytes, &mut 0, SymbolEncoding::Strict).unwrap(),
             K::Lambda(k_dialect)
         );
     }
@@ -3468,7 +3601,7 @@ mod tests {
         for bytes in malformed {
             assert!(
                 matches!(
-                    deserialize(&bytes, &mut 0, false),
+                    deserialize(&bytes, &mut 0, SymbolEncoding::Strict),
                     Err(XqdbError::DeserializationErr(_))
                 ),
                 "malformed lambda unexpectedly decoded: {bytes:?}"
@@ -3538,7 +3671,10 @@ mod tests {
         dict.insert("a".to_string(), K::I64(1));
         dict.insert("b".to_string(), K::F64(1.0));
         let k = K::Dict(dict);
-        assert_eq!(deserialize(&vec, &mut 0, false).unwrap(), k);
+        assert_eq!(
+            deserialize(&vec, &mut 0, SymbolEncoding::Strict).unwrap(),
+            k
+        );
         assert_eq!(vec, serialize(&k).unwrap());
     }
 
@@ -3610,13 +3746,19 @@ mod tests {
         assert_eq!(boolean_bytes, [1, 0, 3, 0, 0, 0, 1, 0, 0]);
         assert_eq!(byte_bytes, [4, 0, 3, 0, 0, 0, 7, 0, 9]);
         assert_eq!(
-            serialize(&deserialize(&boolean_bytes, &mut 0, false).expect("deserialize boolean"))
-                .expect("reserialize boolean"),
+            serialize(
+                &deserialize(&boolean_bytes, &mut 0, SymbolEncoding::Strict)
+                    .expect("deserialize boolean")
+            )
+            .expect("reserialize boolean"),
             boolean_bytes
         );
         assert_eq!(
-            serialize(&deserialize(&byte_bytes, &mut 0, false).expect("deserialize byte"))
-                .expect("reserialize byte"),
+            serialize(
+                &deserialize(&byte_bytes, &mut 0, SymbolEncoding::Strict)
+                    .expect("deserialize byte")
+            )
+            .expect("reserialize byte"),
             byte_bytes
         );
 
@@ -3624,8 +3766,11 @@ mod tests {
             .expect("nullable table");
         let table_bytes = serialize(&K::DataFrame(table.clone())).expect("serialize table");
         assert_eq!(
-            serialize(&deserialize(&table_bytes, &mut 0, false).expect("deserialize table"))
-                .expect("reserialize table"),
+            serialize(
+                &deserialize(&table_bytes, &mut 0, SymbolEncoding::Strict)
+                    .expect("deserialize table")
+            )
+            .expect("reserialize table"),
             table_bytes
         );
         assert_ipc_header_matches_body(K::Series(boolean));
@@ -3679,13 +3824,13 @@ mod tests {
     fn rejects_non_utf8_q_char_columns_without_losing_top_level_bytes() {
         let top_level = [10, 0, 1, 0, 0, 0, 0xff];
         assert_eq!(
-            deserialize(&top_level, &mut 0, false).expect("top-level bytes"),
+            deserialize(&top_level, &mut 0, SymbolEncoding::Strict).expect("top-level bytes"),
             K::CharVector(vec![0xff])
         );
 
         let nested = [0, 0, 1, 0, 0, 0, 10, 0, 1, 0, 0, 0, 0xff];
         assert!(matches!(
-            deserialize(&nested, &mut 0, false),
+            deserialize(&nested, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
 
@@ -3693,9 +3838,206 @@ mod tests {
             98, 0, 99, 11, 0, 1, 0, 0, 0, b'c', 0, 0, 0, 1, 0, 0, 0, 10, 0, 1, 0, 0, 0, 0xff,
         ];
         assert!(matches!(
-            deserialize(&table, &mut 0, false),
+            deserialize(&table, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
+    }
+
+    fn string_values(series: &Series) -> Vec<String> {
+        series
+            .cast(&PolarsDataType::String)
+            .expect("series should cast to strings")
+            .str()
+            .expect("string series")
+            .iter()
+            .map(|value| value.expect("non-null value").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn symbol_encoding_names_round_trip_and_default_to_strict() {
+        assert_eq!(SymbolEncoding::default(), SymbolEncoding::Strict);
+        for encoding in [SymbolEncoding::Strict, SymbolEncoding::Lossy] {
+            assert_eq!(SymbolEncoding::from_name(encoding.name()), Some(encoding));
+        }
+        assert_eq!(SymbolEncoding::from_name("latin1"), None);
+        assert_eq!(SymbolEncoding::from_name("Lossy"), None);
+    }
+
+    #[test]
+    fn lossy_symbol_lists_transcode_invalid_bytes_and_keep_every_terminator() {
+        // Symbols: "a", a lone Latin-1 byte, an invalid byte inside a symbol, and a truncated
+        // three-byte sequence right before its NUL terminator.
+        let vec = [
+            11, 0, 4, 0, 0, 0, b'a', 0, 0xe9, 0, b'c', 0xff, b'd', 0, 0xe2, 0x82, 0,
+        ];
+        assert!(matches!(
+            deserialize(&vec, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Lossy).expect("lossy symbol list");
+        let mut expected = vec![11, 0, 4, 0, 0, 0, b'a', 0];
+        expected.extend_from_slice("\u{FFFD}\0c\u{FFFD}d\0\u{FFFD}\0".as_bytes());
+        assert_eq!(serialize(&k).unwrap(), expected);
+        let series: Series = k.try_into().unwrap();
+        assert_eq!(
+            string_values(&series),
+            ["a", "\u{FFFD}", "c\u{FFFD}d", "\u{FFFD}"]
+        );
+    }
+
+    #[test]
+    fn lossy_symbol_atoms_column_names_and_dictionary_keys_transcode() {
+        let atom = [245, 0xe9, b'x', 0];
+        assert!(matches!(
+            deserialize(&atom, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        assert_eq!(
+            deserialize(&atom, &mut 0, SymbolEncoding::Lossy).expect("lossy symbol atom"),
+            K::Symbol("\u{FFFD}x".to_string())
+        );
+
+        let table = [
+            98, 0, 99, 11, 0, 1, 0, 0, 0, 0xe9, 0, 0, 0, 1, 0, 0, 0, 7, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        assert!(matches!(
+            deserialize(&table, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        let frame: DataFrame = deserialize(&table, &mut 0, SymbolEncoding::Lossy)
+            .expect("lossy table")
+            .try_into()
+            .unwrap();
+        assert_eq!(frame.get_column_names(), ["\u{FFFD}"]);
+
+        let dictionary = [
+            99, 11, 0, 1, 0, 0, 0, 0xe9, 0, 7, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(matches!(
+            deserialize(&dictionary, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        assert_eq!(
+            deserialize(&dictionary, &mut 0, SymbolEncoding::Lossy).expect("lossy dictionary"),
+            K::Dict(IndexMap::from([("\u{FFFD}".to_string(), K::I64(1))]))
+        );
+    }
+
+    #[test]
+    fn lossy_char_columns_replace_each_non_ascii_row() {
+        let table = [
+            98, 0, 99, 11, 0, 1, 0, 0, 0, b'c', 0, 0, 0, 1, 0, 0, 0, 10, 0, 3, 0, 0, 0, b'a', 0xe9,
+            b'z',
+        ];
+        assert!(matches!(
+            deserialize(&table, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        let frame: DataFrame = deserialize(&table, &mut 0, SymbolEncoding::Lossy)
+            .expect("lossy char column")
+            .try_into()
+            .unwrap();
+        let column = frame.column("c").unwrap().as_materialized_series();
+        assert_eq!(column.dtype(), &PolarsDataType::String);
+        assert_eq!(string_values(column), ["a", "\u{FFFD}", "z"]);
+    }
+
+    #[test]
+    fn lossy_string_columns_transcode_each_row_on_its_own() {
+        // Concatenated, the rows read "a" C3 A9 "b" C3 A9, which is valid UTF-8 as a whole; the
+        // boundary between the first two rows splits the code point, so both rows are invalid
+        // and only the third decodes as "é".
+        let vec = [
+            0, 0, 3, 0, 0, 0, 10, 0, 2, 0, 0, 0, b'a', 0xc3, 10, 0, 2, 0, 0, 0, 0xa9, b'b', 10, 0,
+            2, 0, 0, 0, 0xc3, 0xa9,
+        ];
+        assert!(matches!(
+            deserialize(&vec, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        let k = deserialize(&vec, &mut 0, SymbolEncoding::Lossy).expect("lossy string column");
+        let mut expected = vec![0, 0, 3, 0, 0, 0, 10, 0, 4, 0, 0, 0];
+        expected.extend_from_slice("a\u{FFFD}".as_bytes());
+        expected.extend_from_slice(&[10, 0, 4, 0, 0, 0]);
+        expected.extend_from_slice("\u{FFFD}b".as_bytes());
+        expected.extend_from_slice(&[10, 0, 2, 0, 0, 0, 0xc3, 0xa9]);
+        assert_eq!(serialize(&k).unwrap(), expected);
+        let series: Series = k.try_into().unwrap();
+        assert_eq!(string_values(&series), ["a\u{FFFD}", "\u{FFFD}b", "é"]);
+    }
+
+    #[test]
+    fn lossy_nested_symbol_lists_transcode_invalid_symbols() {
+        let vec = [
+            0, 0, 2, 0, 0, 0, 11, 0, 1, 0, 0, 0, 0xe9, 0, 11, 0, 2, 0, 0, 0, b'a', 0, b'b', 0,
+        ];
+        assert!(matches!(
+            deserialize(&vec, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        let series: Series = deserialize(&vec, &mut 0, SymbolEncoding::Lossy)
+            .expect("lossy nested symbols")
+            .try_into()
+            .unwrap();
+        let strings = series
+            .cast(&PolarsDataType::List(Box::new(PolarsDataType::String)))
+            .expect("nested symbols cast to nested strings");
+        let rows: Vec<Vec<String>> = (0..strings.len())
+            .map(|row| string_values(&strings.list().unwrap().get_as_series(row).unwrap()))
+            .collect();
+        assert_eq!(
+            rows,
+            [vec!["\u{FFFD}".to_string()], vec!["a".into(), "b".into()]]
+        );
+    }
+
+    #[test]
+    fn lossy_lambdas_transcode_source_and_context() {
+        let mut vec = vec![100, 0xe9, 0, 10, 0, 5, 0, 0, 0];
+        vec.extend_from_slice(&[b'{', b'x', b'+', 0xe9, b'}']);
+        assert!(matches!(
+            deserialize(&vec, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        assert_eq!(
+            deserialize(&vec, &mut 0, SymbolEncoding::Lossy).expect("lossy lambda"),
+            K::Lambda(QLambda::with_context("{x+\u{FFFD}}", "\u{FFFD}").unwrap())
+        );
+    }
+
+    #[test]
+    fn q_error_messages_surface_under_every_encoding() {
+        let error = [128, b'c', b'a', b'f', 0xe9, 0];
+        for encoding in [SymbolEncoding::Strict, SymbolEncoding::Lossy] {
+            assert!(matches!(
+                deserialize(&error, &mut 0, encoding),
+                Err(XqdbError::ServerErr(message)) if message == "caf\u{FFFD}"
+            ));
+        }
+    }
+
+    #[test]
+    fn valid_text_decodes_identically_under_both_encodings() {
+        let table = [
+            98, 0, 99, 11, 0, 2, 0, 0, 0, b's', 0, b't', 0, 0, 0, 2, 0, 0, 0, 11, 0, 2, 0, 0, 0,
+            0xc3, 0xa9, 0, b'x', 0, 0, 0, 2, 0, 0, 0, 10, 0, 2, 0, 0, 0, 0xc3, 0xa9, 10, 0, 1, 0,
+            0, 0, b'y',
+        ];
+        let strict = deserialize(&table, &mut 0, SymbolEncoding::Strict).expect("strict table");
+        let lossy = deserialize(&table, &mut 0, SymbolEncoding::Lossy).expect("lossy table");
+        assert_eq!(strict, lossy);
+        let frame: DataFrame = lossy.try_into().unwrap();
+        assert_eq!(
+            string_values(frame.column("s").unwrap().as_materialized_series()),
+            ["é", "x"]
+        );
+        assert_eq!(
+            string_values(frame.column("t").unwrap().as_materialized_series()),
+            ["é", "y"]
+        );
     }
 
     #[test]
@@ -3704,7 +4046,7 @@ mod tests {
             98, 0, 99, 11, 0, 1, 0, 0, 0, b'x', 0, 0, 0, 1, 0, 0, 0, 13, 0, 1, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert!(matches!(
-            deserialize(&table, &mut 0, false),
+            deserialize(&table, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::NotSupportedKListErr(13))
         ));
     }
@@ -3718,7 +4060,7 @@ mod tests {
             mixed = outer;
         }
         assert!(matches!(
-            deserialize(&mixed, &mut 0, false),
+            deserialize(&mixed, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
 
@@ -3729,7 +4071,7 @@ mod tests {
             dictionary = outer;
         }
         assert!(matches!(
-            deserialize(&dictionary, &mut 0, false),
+            deserialize(&dictionary, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
     }
@@ -3773,7 +4115,7 @@ mod tests {
         expected_chars.insert("a".to_string(), K::Char(b'x'));
         expected_chars.insert("b".to_string(), K::Char(b'y'));
         assert_eq!(
-            deserialize(&chars, &mut 0, false).expect("char dictionary"),
+            deserialize(&chars, &mut 0, SymbolEncoding::Strict).expect("char dictionary"),
             K::Dict(expected_chars)
         );
 
@@ -3786,7 +4128,7 @@ mod tests {
         expected_guids.insert("a".to_string(), K::Guid(Uuid::from_bytes(first)));
         expected_guids.insert("b".to_string(), K::Guid(Uuid::from_bytes(second)));
         assert_eq!(
-            deserialize(&guids, &mut 0, false).expect("GUID dictionary"),
+            deserialize(&guids, &mut 0, SymbolEncoding::Strict).expect("GUID dictionary"),
             K::Dict(expected_guids)
         );
 
@@ -3794,7 +4136,7 @@ mod tests {
             99, 11, 0, 2, 0, 0, 0, b'a', 0, b'b', 0, 10, 0, 1, 0, 0, 0, b'x',
         ];
         assert!(matches!(
-            deserialize(&mismatched, &mut 0, false),
+            deserialize(&mismatched, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
     }
@@ -3842,7 +4184,8 @@ mod tests {
             let raw = i64::from_le_bytes(serialized[1..9].try_into().expect("q timestamp payload"));
             assert_eq!(raw, unix_nanoseconds - NANOS_DIFF);
             assert_eq!(
-                deserialize(&serialized, &mut 0, false).expect("deserialize timestamp"),
+                deserialize(&serialized, &mut 0, SymbolEncoding::Strict)
+                    .expect("deserialize timestamp"),
                 K::DateTime(timestamp)
             );
         }
@@ -3884,14 +4227,14 @@ mod tests {
         let mut atom = vec![244];
         atom.extend_from_slice(&first_unrepresentable_q_timestamp.to_le_bytes());
         assert!(matches!(
-            deserialize(&atom, &mut 0, false),
+            deserialize(&atom, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
 
         let mut list = vec![12, 0, 1, 0, 0, 0];
         list.extend_from_slice(&first_unrepresentable_q_timestamp.to_le_bytes());
         assert!(matches!(
-            deserialize(&list, &mut 0, false),
+            deserialize(&list, &mut 0, SymbolEncoding::Strict),
             Err(XqdbError::DeserializationErr(_))
         ));
     }

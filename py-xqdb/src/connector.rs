@@ -11,7 +11,7 @@ use pyo3::types::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use std::collections::HashSet;
 use xqdb::connector::Connector;
-use xqdb::types::{MsgType, QLambda, QOperator, K, MIN_Q_TIMESTAMP_UNIX_NANOS};
+use xqdb::types::{MsgType, QLambda, QOperator, SymbolEncoding, K, MIN_Q_TIMESTAMP_UNIX_NANOS};
 
 pub(crate) enum ArrowValue {
     DataFrame(DataFrame),
@@ -93,6 +93,14 @@ impl XqdbQLambda {
 #[pyclass]
 pub struct XqdbConnector {
     q: Connector,
+}
+
+fn parse_symbol_encoding(value: &str) -> PyResult<SymbolEncoding> {
+    SymbolEncoding::from_name(value).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "symbol_encoding must be 'strict' or 'lossy', got {value:?}"
+        ))
+    })
 }
 
 const MAX_CONVERSION_DEPTH: usize = 64;
@@ -265,6 +273,17 @@ impl XqdbConnector {
         Ok(Self {
             q: Connector::new(host, port, user, password, enable_tls, timeout, version),
         })
+    }
+
+    #[getter]
+    fn symbol_encoding(&self) -> &'static str {
+        self.q.symbol_encoding.name()
+    }
+
+    #[setter]
+    fn set_symbol_encoding(&mut self, value: &str) -> PyResult<()> {
+        self.q.symbol_encoding = parse_symbol_encoding(value)?;
+        Ok(())
     }
 
     pub fn connect(&mut self, py: Python) -> Result<(), PyXqdbError> {
@@ -497,10 +516,16 @@ fn cast_to_k_inner(
 }
 
 #[pyfunction]
-pub fn read_j6_binary_table(py: Python, filepath: &str) -> PyResult<Py<ArrowTable>> {
+#[pyo3(signature = (filepath, symbol_encoding = "strict"))]
+pub fn read_j6_binary_table(
+    py: Python,
+    filepath: &str,
+    symbol_encoding: &str,
+) -> PyResult<Py<ArrowTable>> {
+    let encoding = parse_symbol_encoding(symbol_encoding)?;
     let filepath = filepath.to_owned();
     let frame = py
-        .detach(move || xqdb::io::read_j6_binary_table(&filepath))
+        .detach(move || xqdb::io::read_j6_binary_table(&filepath, encoding))
         .map_err(PyXqdbError::from)?;
     Py::new(py, ArrowTable::new(frame))
 }

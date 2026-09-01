@@ -10,7 +10,7 @@ use xxhash_rust::xxh32;
 use crate::connector::ipc_length_header;
 use crate::errors::XqdbError;
 use crate::serde6;
-use crate::types::{MsgType, K};
+use crate::types::{MsgType, SymbolEncoding, K};
 
 const KXZIP_MAGIC: &[u8; 8] = b"kxzipped";
 const KXZIP_HEADER_LENGTH: usize = 8;
@@ -137,7 +137,7 @@ fn decompression_error(error: io::Error) -> XqdbError {
     ))
 }
 
-pub fn read_j6_binary_table(path: &str) -> Result<DataFrame, XqdbError> {
+pub fn read_j6_binary_table(path: &str, encoding: SymbolEncoding) -> Result<DataFrame, XqdbError> {
     let metadata = std::fs::metadata(path).map_err(XqdbError::IOError)?;
     if !metadata.is_file() {
         return Err(XqdbError::Err(format!(
@@ -171,7 +171,7 @@ pub fn read_j6_binary_table(path: &str) -> Result<DataFrame, XqdbError> {
         )));
     }
 
-    match serde6::deserialize(&buffer, &mut 2, false)? {
+    match serde6::deserialize(&buffer, &mut 2, encoding)? {
         K::DataFrame(k) => Ok(k),
         _ => Err(XqdbError::Err("Not a table".to_owned())),
     }
@@ -393,8 +393,8 @@ pub fn generate_j6_ipc_msg(
     }
 }
 
-pub fn deserialize_j6(buf: &[u8]) -> Result<K, XqdbError> {
-    serde6::deserialize(buf, &mut 0, false)
+pub fn deserialize_j6(buf: &[u8], encoding: SymbolEncoding) -> Result<K, XqdbError> {
+    serde6::deserialize(buf, &mut 0, encoding)
 }
 
 #[cfg(test)]
@@ -411,7 +411,7 @@ mod tests {
     use crate::{
         io,
         serde6::{deserialize, serialize},
-        types::K,
+        types::{SymbolEncoding, K},
     };
 
     fn one_block_kxzip(block: &[u8], encoded_size: u32, unzipped_size: u64) -> Vec<u8> {
@@ -438,6 +438,7 @@ mod tests {
             let error = io::read_j6_binary_table(
                 path.to_str()
                     .expect("temporary q binary fixture path is not UTF-8"),
+                SymbolEncoding::Strict,
             )
             .expect_err("short q binary file should fail");
             assert!(matches!(
@@ -457,6 +458,7 @@ mod tests {
         let error = io::read_j6_binary_table(
             path.to_str()
                 .expect("temporary q binary fixture path is not UTF-8"),
+            SymbolEncoding::Strict,
         )
         .expect_err("missing symbol terminator must fail");
         assert!(matches!(
@@ -489,6 +491,7 @@ mod tests {
             std::env::temp_dir()
                 .to_str()
                 .expect("temporary directory path is not UTF-8"),
+            SymbolEncoding::Strict,
         )
         .expect_err("directory path should fail");
         assert!(error.to_string().contains("not a regular file"));
@@ -573,7 +576,8 @@ mod tests {
     fn deserialize_j6_rejects_trailing_bytes() {
         let mut bytes = serialize(&K::I32(42)).expect("test value should serialize");
         bytes.push(0);
-        let error = io::deserialize_j6(&bytes).expect_err("trailing J6 bytes should fail");
+        let error = io::deserialize_j6(&bytes, SymbolEncoding::Strict)
+            .expect_err("trailing J6 bytes should fail");
         assert!(error.to_string().contains("trailing byte"));
     }
 
@@ -593,6 +597,7 @@ mod tests {
         let error = io::read_j6_binary_table(
             path.to_str()
                 .expect("temporary q binary fixture path is not UTF-8"),
+            SymbolEncoding::Strict,
         )
         .expect_err("trailing q binary file bytes should fail");
         assert!(error.to_string().contains("trailing byte"));
@@ -618,7 +623,7 @@ mod tests {
         ]
         .to_vec();
         assert_eq!(io::unzip(&zipped).unwrap(), unzipped);
-        let k = deserialize(&unzipped, &mut 2, false).unwrap();
+        let k = deserialize(&unzipped, &mut 2, SymbolEncoding::Strict).unwrap();
         let df: DataFrame = k.try_into().unwrap();
         let sym = Series::from_arrow(
             "sym".into(),

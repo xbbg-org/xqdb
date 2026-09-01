@@ -83,8 +83,11 @@ conn = xqdb.Q('localhost', 1800, enable_tls=True, retries=3, timeout=30)
 | `enable_tls` | `bool` | `False`     | Enable TLS with platform certificate verification |
 | `retries`    | `int`  | `0`         | Number of retries with exponential backoff          |
 | `timeout`    | `int`  | `0`         | Connection timeout in seconds (0 = no timeout)     |
+| `symbol_encoding` | `str` | `"strict"` | How q text that is not valid UTF-8 is decoded: `"strict"` fails the response, `"lossy"` replaces each invalid byte sequence with U+FFFD |
 
 q IPC authentication sends credentials in cleartext when TLS is disabled. Enable TLS for credentialed connections unless another trusted transport already protects the socket.
+
+q stores symbols and strings as raw bytes and never validates them, while Arrow string columns must be valid UTF-8. With the default `symbol_encoding="strict"`, a result carrying a stray Latin-1 or binary byte in a symbol, symbol column, string column, char column, or lambda fails as an `XqdbError` naming the offending value. Opt in to `symbol_encoding="lossy"` — at construction or later through `conn.symbol_encoding = "lossy"` — to decode such text with each maximal invalid sequence replaced by `"\ufffd"`, so every other value in the result survives intact. Valid text decodes identically under both policies, and q error messages always surface with replacement characters rather than being hidden behind a decoding failure.
 
 ### Narwhals DataFrames and Backend Selection
 
@@ -237,12 +240,13 @@ buffer = serialize_as_ipc_bytes6("sync", True, ["upd", "table", frame])
 
 ### Read Binary Table
 
-Read a regular q binary table file directly into a Narwhals DataFrame. Select the native output backend independently of the file format.
+Read a regular q binary table file directly into a Narwhals DataFrame. Select the native output backend independently of the file format, and pass `symbol_encoding` to decode text that is not valid UTF-8 the same way `Q` does.
 
 ```python
 from xqdb import read_binary6
 
 df = read_binary6("/path/to/table.bin", backend="pandas")
+df = read_binary6("/path/to/legacy.bin", symbol_encoding="lossy")
 ```
 
 ## Error Handling

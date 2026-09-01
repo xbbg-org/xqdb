@@ -3,15 +3,18 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use napi::bindgen_prelude::{AsyncTask, Env, Task, Unknown};
 use napi_derive::napi;
 use xqdb::io::{generate_j6_ipc_msg, read_j6_binary_table};
-use xqdb::types::{MsgType, K};
+use xqdb::types::{MsgType, SymbolEncoding, K};
 
-use crate::dto::{k_into_native, snapshot_native_value, NativeResult, OwnedNativeValue};
+use crate::dto::{
+    k_into_native, parse_symbol_encoding, snapshot_native_value, NativeResult, OwnedNativeValue,
+};
 use crate::error::BindingError;
 
 enum UtilityOperation {
     Ready(Option<NativeResult>),
     ReadBinary {
         path: String,
+        encoding: SymbolEncoding,
     },
     Serialize {
         message_type: String,
@@ -53,10 +56,10 @@ impl Task for UtilityTask {
                     "native utility task was computed more than once",
                 ))
             }),
-            UtilityOperation::ReadBinary { path } => {
+            UtilityOperation::ReadBinary { path, encoding } => {
                 let result = validate_read_binary_path(&path)
                     .and_then(|()| {
-                        read_j6_binary_table(&path)
+                        read_j6_binary_table(&path, encoding)
                             .map(K::DataFrame)
                             .map_err(BindingError::from)
                     })
@@ -92,10 +95,14 @@ impl Task for UtilityTask {
 }
 
 #[napi(js_name = "readBinary6")]
-pub fn read_binary6(path: String) -> AsyncTask<UtilityTask> {
-    AsyncTask::new(UtilityTask {
-        operation: UtilityOperation::ReadBinary { path },
-    })
+pub fn read_binary6(path: String, symbol_encoding: Option<String>) -> AsyncTask<UtilityTask> {
+    let operation = match parse_symbol_encoding(symbol_encoding.as_deref()) {
+        Ok(encoding) => UtilityOperation::ReadBinary { path, encoding },
+        Err(message) => UtilityOperation::Ready(Some(NativeResult::failure(
+            BindingError::conversion(message),
+        ))),
+    };
+    AsyncTask::new(UtilityTask { operation })
 }
 
 #[napi(

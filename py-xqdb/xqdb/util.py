@@ -6,8 +6,12 @@ from xqdb.xqdb import generate_j6_ipc_msg, read_j6_binary_table
 _MSG_TYPES = {"async": 0, "sync": 1, "response": 2}
 
 
-def read_binary6(filepath: str, backend: str = "pyarrow") -> Any:
-    return from_arrow_results(read_j6_binary_table(filepath), backend)
+def read_binary6(
+    filepath: str, backend: str = "pyarrow", symbol_encoding: str = "strict"
+) -> Any:
+    return from_arrow_results(
+        read_j6_binary_table(filepath, symbol_encoding=symbol_encoding), backend
+    )
 
 
 def serialize_as_ipc_bytes6(

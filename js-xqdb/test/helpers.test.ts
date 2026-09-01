@@ -36,6 +36,33 @@ describe("binary helpers", () => {
     expect([...decoded.getChild("size")!]).toEqual([10n, 20n]);
   });
 
+  it("forwards symbolEncoding to the native reader and validates it first", async () => {
+    const calls: unknown[][] = [];
+    const table = tableFromArrays({ size: BigInt64Array.of(1n) });
+    loaderMock.loadNativeBinding.mockResolvedValue({
+      NativeConnector: class NativeConnector {},
+      readBinary6: async (...args: unknown[]) => {
+        calls.push(args);
+        return { ok: true, value: { tag: "table", bytesValue: tableToIPC(table, "stream") } };
+      },
+      serializeAsIpcBytes6: async () => ({ ok: true }),
+    });
+
+    await readBinary6("trade.bin");
+    await readBinary6("trade.bin", { symbolEncoding: "lossy" });
+    await readBinary6("trade.bin", { symbolEncoding: "strict" });
+
+    expect(calls).toEqual([
+      ["trade.bin", undefined],
+      ["trade.bin", "lossy"],
+      ["trade.bin", "strict"],
+    ]);
+    await expect(
+      readBinary6("trade.bin", { symbolEncoding: "latin1" as never }),
+    ).rejects.toThrowError(RangeError);
+    expect(calls).toHaveLength(3);
+  });
+
   it("normalizes helper input and returns exact serialized bytes as a Buffer", async () => {
     let capturedValue: NativeValue | undefined;
     const expected = Uint8Array.of(1, 0, 0, 0, 255);

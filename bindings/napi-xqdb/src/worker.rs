@@ -13,10 +13,11 @@ use napi_derive::napi;
 use rustls_pki_types::ServerName;
 use xqdb::connector::{Connector, ConnectorAbortHandle};
 use xqdb::errors::XqdbError;
+use xqdb::types::SymbolEncoding;
 
 use crate::dto::{
-    k_into_native, native_values_into_k, snapshot_native_values, NativeOptions, NativeResult,
-    OwnedNativeValue,
+    k_into_native, native_values_into_k, parse_symbol_encoding, snapshot_native_values,
+    NativeOptions, NativeResult, OwnedNativeValue,
 };
 use crate::error::BindingError;
 
@@ -44,6 +45,7 @@ struct WorkerOptions {
     password: String,
     tls: bool,
     timeout_seconds: u64,
+    symbol_encoding: SymbolEncoding,
 }
 
 struct DeferredReply(Option<NativeDeferred>);
@@ -353,6 +355,8 @@ impl TryFrom<NativeOptions> for WorkerOptions {
                 "timeoutSeconds must not exceed 86400 (24 hours)",
             ));
         }
+        let symbol_encoding = parse_symbol_encoding(options.symbol_encoding.as_deref())
+            .map_err(|message| Error::new(Status::InvalidArg, message))?;
         Ok(Self {
             host,
             port: options.port,
@@ -360,13 +364,14 @@ impl TryFrom<NativeOptions> for WorkerOptions {
             password: options.password.unwrap_or_default(),
             tls,
             timeout_seconds: timeout_seconds as u64,
+            symbol_encoding,
         })
     }
 }
 
 impl WorkerOptions {
     fn into_connector(self) -> Connector {
-        Connector::new(
+        let mut connector = Connector::new(
             &self.host,
             self.port,
             &self.user,
@@ -374,7 +379,9 @@ impl WorkerOptions {
             self.tls,
             self.timeout_seconds,
             IPC_VERSION,
-        )
+        );
+        connector.symbol_encoding = self.symbol_encoding;
+        connector
     }
 }
 
@@ -586,8 +593,8 @@ mod tests {
 
     use super::{
         admission_failure, run_worker, spawn_worker_reaper, validate_expression_length, Command,
-        Connector, NativeConnector, WorkerOptions, COMMAND_QUEUE_CAPACITY, MAX_EXPRESSION_BYTES,
-        MAX_TIMEOUT_SECONDS,
+        Connector, NativeConnector, SymbolEncoding, WorkerOptions, COMMAND_QUEUE_CAPACITY,
+        MAX_EXPRESSION_BYTES, MAX_TIMEOUT_SECONDS,
     };
     use crate::dto::NativeOptions;
     use crate::error::{CODE_BACKPRESSURE, CODE_CONVERSION, CODE_INTERNAL, CODE_IO};
@@ -600,6 +607,7 @@ mod tests {
             password: String::new(),
             tls: false,
             timeout_seconds: 0,
+            symbol_encoding: SymbolEncoding::Strict,
         }
     }
 
@@ -615,6 +623,7 @@ mod tests {
             password: None,
             tls: None,
             timeout_seconds: Some(timeout_seconds),
+            symbol_encoding: None,
         }
     }
 
@@ -894,6 +903,34 @@ mod tests {
                 .err()
                 .expect("invalid timeout must be rejected");
             assert_eq!(error.status, Status::InvalidArg);
+        }
+    }
+
+    #[test]
+    fn symbol_encoding_defaults_to_strict_and_rejects_unknown_names() {
+        let default = WorkerOptions::try_from(native_options(1)).expect("default options");
+        assert_eq!(default.symbol_encoding, SymbolEncoding::Strict);
+        assert_eq!(
+            default.into_connector().symbol_encoding,
+            SymbolEncoding::Strict
+        );
+
+        let mut lossy = native_options(1);
+        lossy.symbol_encoding = Some("lossy".into());
+        let lossy = WorkerOptions::try_from(lossy).expect("lossy options");
+        assert_eq!(
+            lossy.into_connector().symbol_encoding,
+            SymbolEncoding::Lossy
+        );
+
+        for invalid in ["", "Lossy", "latin1", "utf-8"] {
+            let mut options = native_options(1);
+            options.symbol_encoding = Some(invalid.into());
+            let error = WorkerOptions::try_from(options)
+                .err()
+                .expect("unknown symbolEncoding must be rejected");
+            assert_eq!(error.status, Status::InvalidArg);
+            assert!(error.reason.contains("symbolEncoding"), "{error}");
         }
     }
 

@@ -11,6 +11,7 @@ import type {
   NativeResult,
   NativeValue,
 } from "./native-contract.js";
+import { validatedSymbolEncoding } from "./types.js";
 import type { XqdbInput, XqdbValue, QOptions } from "./types.js";
 
 interface NormalizedOptions {
@@ -40,6 +41,7 @@ function normalizeOptions(options: QOptions): NormalizedOptions {
   }
 
   const timeoutSeconds = Math.ceil((options.timeout ?? 30_000) / 1_000);
+  const symbolEncoding = validatedSymbolEncoding(options.symbolEncoding, "QOptions");
   const native: NativeOptions = {
     host: options.host,
     port: options.port,
@@ -47,6 +49,7 @@ function normalizeOptions(options: QOptions): NormalizedOptions {
     ...(options.password === undefined ? {} : { password: options.password }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutSeconds,
+    ...(symbolEncoding === undefined ? {} : { symbolEncoding }),
   };
   return { native, retries: options.retries ?? 0 };
 }
