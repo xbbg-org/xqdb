@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "napi-xqdb"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "indexmap",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "py-xqdb"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "indexmap",
@@ -4027,7 +4027,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xqdb"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytemuck",
  "chrono",

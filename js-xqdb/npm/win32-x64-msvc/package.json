@@ -1,6 +1,6 @@
 {
   "name": "@xbbg/xqdb-win32-x64-msvc",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Windows x64 native addon for xqdb",
   "author": "XQDB contributors",
   "main": "xqdb.win32-x64-msvc.node",

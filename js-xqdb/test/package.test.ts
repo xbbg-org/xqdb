@@ -54,7 +54,7 @@ describe("npm package metadata", () => {
     const root = await readPackageMetadata<RootPackageMetadata>("../package.json");
 
     expect(root.name).toBe("@xbbg/xqdb");
-    expect(root.version).toBe("0.1.6");
+    expect(root.version).toBe("0.1.7");
     expect(root.author).toBe("XQDB contributors");
     expect(root.repository.url).toBe("git+https://github.com/xbbg-org/xqdb.git");
     expect(root.engines.node).toBe(">=20");

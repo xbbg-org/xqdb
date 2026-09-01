@@ -1,6 +1,6 @@
 # Release Rules
 
-<!-- last-analyzed: 2026-08-28T02:50:00Z -->
+<!-- last-analyzed: 2026-09-01T22:30:00Z -->
 
 ## Version Sources
 
@@ -65,10 +65,29 @@ above.
   smoke-tests, and publishes.
 - **PyPI**: manual `workflow_dispatch` of `CI.yml` with `dry-run: false`, from the
   default branch, and only on repository `xbbg-org/xqdb`. A tag push does not
-  publish to PyPI.
+  publish to PyPI. The `source` job requires the exact `v<version>` tag on the
+  dispatched commit, so push the tag before dispatching.
 - Tags must be pushed to the `xqdb` remote (`xbbg-org/xqdb`). `Taskfile.yml`'s
   `tag` task pushes to `origin`, which is `jshinonome/kola` — the upstream this
   project forked from. Do not use it.
+
+### Publish jobs wait for an environment approval
+
+Both publish jobs run in a protected GitHub environment with a required
+reviewer: `publish` in `NPM.yml` uses environment `npm`, `release` in `CI.yml`
+uses environment `pypi`. Once the build jobs succeed the run sits in `waiting`
+until someone approves the deployment — the v0.1.6 npm run waited three days
+unnoticed. Approve from the run page or with:
+
+```bash
+run_id=$(gh run list --repo xbbg-org/xqdb --workflow NPM.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+env_id=$(gh api "repos/xbbg-org/xqdb/actions/runs/$run_id/pending_deployments" --jq '.[0].environment.id')
+gh api -X POST "repos/xbbg-org/xqdb/actions/runs/$run_id/pending_deployments" \
+  -f "environment_ids[]=$env_id" -f state=approved -f comment="release"
+```
+
+The `github-release` job in each workflow runs only after its publish job, so an
+unapproved run also leaves no GitHub Release and no attached artifacts.
 
 ## Test Gate
 
@@ -132,5 +151,7 @@ part from `git log <prev-tag>..HEAD --no-merges --format="%s"`.
 ## First-Time Setup Gaps
 
 None. Release workflows exist, build artifacts are gitignored, and tags are in
-use (`v0.1.0` through `v0.1.3`). `v0.1.4` is prepared in the manifests but not
-yet tagged.
+use (`v0.1.0` through `v0.1.6`). npm has published `0.1.3` through `0.1.5`; PyPI
+has `0.1.1` through `0.1.3` — the 0.1.4–0.1.6 Python releases were never
+dispatched, so the next PyPI release note must carry the 0.1.4 timestamp
+migration.
