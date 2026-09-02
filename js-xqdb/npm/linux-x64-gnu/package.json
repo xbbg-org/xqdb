@@ -1,6 +1,6 @@
 {
   "name": "@xbbg/xqdb-linux-x64-gnu",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Linux x64 glibc native addon for xqdb",
   "author": "XQDB contributors",
   "main": "xqdb.linux-x64-gnu.node",

@@ -1,6 +1,6 @@
 {
   "name": "@xbbg/xqdb",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Typed Node.js bindings for q IPC backed by xqdb",
   "author": "XQDB contributors",
   "type": "module",
