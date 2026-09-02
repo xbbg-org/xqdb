@@ -103,7 +103,7 @@ const scoped = new XqdbQLambda("{x+y}", "analytics");
 | `string` | symbol; embedded NUL is rejected |
 | `Buffer` or `Uint8Array` | char vector, preserving arbitrary bytes |
 | ordinary array | mixed list |
-| plain string-keyed object | dictionary; keys cannot contain NUL |
+| plain string-keyed object | dictionary; keys cannot contain NUL; `{}` becomes `` (`symbol$())!() `` |
 | Apache Arrow `Vector` | typed series/list through Arrow IPC |
 | Apache Arrow `Table` | table through Arrow IPC |
 | `XqdbTimestamp` | timestamp as Unix-epoch nanoseconds |
@@ -130,7 +130,7 @@ const scoped = new XqdbQLambda("{x+y}", "analytics");
 | lambda | `XqdbQLambda` |
 | typed list | Apache Arrow `Vector` |
 | mixed list | array |
-| dictionary | plain string-keyed object |
+| dictionary | plain string-keyed object; an empty dictionary such as `()!()` becomes `{}` |
 | table | Apache Arrow `Table` |
 
 The temporal wrappers prevent nanosecond values from being rounded through JavaScript `number` or `Date`:

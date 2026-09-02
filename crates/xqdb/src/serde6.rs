@@ -673,7 +673,10 @@ fn deserialize_unchecked(
             deserialize_series(&vec[start_pos..end_pos], k_type, k_type != 10, encoding)
         }
         99 => {
-            if vec[*pos] == 98 {
+            let key_type = *vec.get(*pos).ok_or_else(|| {
+                XqdbError::DeserializationErr("q dictionary omitted its key type".to_string())
+            })?;
+            if key_type == 98 {
                 let mut key_df: DataFrame =
                     deserialize_unchecked(vec, pos, true, encoding, depth + 1)?.try_into()?;
                 let value_df: DataFrame =
@@ -682,16 +685,31 @@ fn deserialize_unchecked(
                     .hstack(value_df.columns())
                     .map_err(|e| XqdbError::Err(e.to_string()))?;
                 Ok(K::DataFrame(key_df))
-            } else if vec[*pos] == 11 {
+            } else if key_type == 11 || key_type == 0 {
                 *pos += 1;
-                let end_pos = calculate_array_end_index(vec, *pos, 11)?;
-                let keys: Series =
-                    deserialize_series(&vec[*pos..end_pos], 11, true, encoding)?.try_into()?;
-                *pos = end_pos;
-                if vec[end_pos] > 19 {
+                let keys: Series = if key_type == 11 {
+                    let end_pos = calculate_array_end_index(vec, *pos, 11)?;
+                    let keys =
+                        deserialize_series(&vec[*pos..end_pos], 11, true, encoding)?.try_into()?;
+                    *pos = end_pos;
+                    keys
+                } else if take_list_length(vec, pos, "q dictionary keys")? == 0 {
+                    // ()!() keys q's empty dictionary literal with an empty general list
+                    // rather than an empty symbol list; a general list can only stand in for
+                    // symbol keys while it holds none.
+                    new_empty_series(11)?.try_into()?
+                } else {
+                    return Err(XqdbError::Err(
+                        "Only support symbol keys dictionary or keyed table, got k type 0"
+                            .to_string(),
+                    ));
+                };
+                let value_type = *vec.get(*pos).ok_or_else(|| {
+                    XqdbError::DeserializationErr("q dictionary omitted its values".to_string())
+                })?;
+                if value_type > 19 {
                     return Err(XqdbError::Err(format!(
-                        "Not support k type {:?} values in dictionary",
-                        vec[end_pos]
+                        "Not support k type {value_type:?} values in dictionary"
                     )));
                 }
                 let values = deserialize_unchecked(vec, pos, is_column, encoding, depth + 1)?;
@@ -747,8 +765,7 @@ fn deserialize_unchecked(
                 Ok(K::Dict(dict))
             } else {
                 Err(XqdbError::Err(format!(
-                    "Only support symbol keys dictionary or keyed table, got k type {:?}",
-                    vec[*pos]
+                    "Only support symbol keys dictionary or keyed table, got k type {key_type:?}"
                 )))
             }
         }
@@ -2045,11 +2062,11 @@ pub(crate) fn serialize_into(k: &K, vec: &mut Vec<u8>) -> Result<(), XqdbError> 
         K::Null => {
             vec.extend_from_slice(&[101, 0]);
         }
+        // An empty map serializes as (`symbol$())!(), the symbol-keyed form q itself
+        // produces for emptied dictionaries and the form this decoder reads back as an
+        // empty map.
         K::Dict(dict) => {
             let length = i32::try_from(dict.len()).map_err(|_| XqdbError::OverLengthErr())?;
-            if length == 0 {
-                return Err(XqdbError::Err("Not supported empty dictionary".to_string()));
-            };
             vec.extend_from_slice(&[99, 11, 0]);
             vec.extend_from_slice(&length.to_le_bytes());
             for key in dict.keys() {
@@ -3678,6 +3695,56 @@ mod tests {
         assert_eq!(vec, serialize(&k).unwrap());
     }
 
+    #[test]
+    fn empty_dictionary_round_trips_as_symbol_keyed_dictionary() {
+        let empty = || K::Dict(IndexMap::new());
+        // (`symbol$())!()
+        let symbol_keyed = [99, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(serialize(&empty()).unwrap(), symbol_keyed);
+        assert_eq!(empty().j6_len().unwrap(), symbol_keyed.len());
+        assert_eq!(
+            deserialize(&symbol_keyed, &mut 0, SymbolEncoding::Strict).unwrap(),
+            empty()
+        );
+        assert_ipc_header_matches_body(empty());
+
+        // ()!() keys with an empty general list; 0#`a`b!1 2 values with an empty long list.
+        for wire in [
+            [99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [99, 11, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0],
+        ] {
+            assert_eq!(
+                deserialize(&wire, &mut 0, SymbolEncoding::Strict).unwrap(),
+                empty()
+            );
+        }
+
+        let nested = K::Dict(IndexMap::from([("nested".to_string(), empty())]));
+        let wire = serialize(&nested).unwrap();
+        assert_eq!(
+            deserialize(&wire, &mut 0, SymbolEncoding::Strict).unwrap(),
+            nested
+        );
+
+        // (1;`a)!2 3: general-list keys stay unsupported once they hold anything.
+        let mixed_keys = [
+            99, 0, 0, 2, 0, 0, 0, 249, 1, 0, 0, 0, 0, 0, 0, 0, 245, 97, 0, 7, 0, 2, 0, 0, 0, 2, 0,
+            0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(matches!(
+            deserialize(&mixed_keys, &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::Err(message)) if message.ends_with("got k type 0")
+        ));
+        assert!(matches!(
+            deserialize(&[99], &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+        assert!(matches!(
+            deserialize(&[99, 11, 0, 0, 0, 0, 0], &mut 0, SymbolEncoding::Strict),
+            Err(XqdbError::DeserializationErr(_))
+        ));
+    }
+
     fn assert_ipc_header_matches_body(value: K) {
         let body_length = value.j6_len().expect("calculate body length");
         let message = crate::io::generate_j6_ipc_msg(crate::types::MsgType::Sync, false, value)
@@ -4152,12 +4219,6 @@ mod tests {
             serialize(&dictionary),
             Err(XqdbError::NotAbleToSerializeErr(_))
         ));
-
-        let nested_empty_dictionary = K::Dict(IndexMap::from([(
-            "nested".to_string(),
-            K::Dict(IndexMap::new()),
-        )]));
-        assert!(serialize(&nested_empty_dictionary).is_err());
 
         let categorical = Series::new("symbol".into(), &["ok", "bad\0symbol"])
             .cast(&PolarsDataType::Categorical(

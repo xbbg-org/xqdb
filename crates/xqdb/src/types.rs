@@ -343,10 +343,8 @@ impl K {
             }
             K::Null => Ok(2),
             K::Dict(dict) => {
-                if dict.is_empty() {
-                    return Err(XqdbError::Err("Not supported empty dictionary".to_string()));
-                }
                 checked_q_count(dict.len())?;
+                // 99 + symbol list(6) + values(6); an empty map is exactly this frame.
                 let mut length = 13usize;
                 for (key, value) in dict {
                     validate_q_symbol(key)?;

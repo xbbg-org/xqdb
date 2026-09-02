@@ -53,6 +53,7 @@ describe("public value conversion", () => {
         { key: "size", value: { tag: "i64", bigintValue: 10n } },
       ],
     });
+    expect(normalizeInput({})).toEqual({ tag: "dictionary", entries: [] });
   });
 
   it("round-trips precise temporal wrapper payloads", () => {
@@ -260,6 +261,7 @@ describe("public value conversion", () => {
       ],
     });
     expect(Object.getOwnPropertyDescriptor(dictionary, "__proto__")?.value).toBe("safe");
+    expect(normalizeOutput({ tag: "dictionary", entries: [] })).toEqual({});
 
     const vector = tableFromArrays({ value: Int32Array.of(1, 2, 3) }).getChild("value")!;
     const ipc = tableToIPC(new Table({ value: vector }), "stream");

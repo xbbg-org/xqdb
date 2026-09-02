@@ -130,6 +130,13 @@ def test_serialization_preserves_python_error_types_and_message_validation():
         serialize_as_ipc_bytes6("invalid", False, 1)
 
 
+def test_empty_dictionary_serializes_as_symbol_keyed_dictionary():
+    # (`symbol$())!(): the form q sends for emptied symbol dictionaries.
+    assert serialize_as_ipc_bytes6("sync", False, {}) == bytes(
+        [1, 1, 0, 0, 21, 0, 0, 0, 99, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
+
+
 def test_exception_module_exports_names():
     from xqdb import exceptions
 
@@ -694,6 +701,15 @@ def test_read_empty_table_preserves_schema(q):
     assert result.schema.field("bool").type == pa.bool_()
 
 
+def test_empty_dictionary_round_trips(q):
+    assert q.sync("()!()") == {}
+    assert q.sync("(`symbol$())!()") == {}
+    assert q.sync("0#`a`b!1 2") == {}
+    assert q.sync("{x}", {}) == {}
+    assert q.sync("{x~(`symbol$())!()}", {})
+    assert q.sync("{x}", {"nested": {}}) == {"nested": {}}
+
+
 def test_output_backend_is_exact_and_input_backend_is_independent(q):
     import pandas as pd
     import polars as pl
@@ -870,8 +886,6 @@ def test_asyn_accepts_arrow_backed_inputs(q):
 def test_error_auto_connect_and_fixture(q):
     with pytest.raises(XqdbError, match="type"):
         q.sync("1+`a")
-    with pytest.raises(XqdbError, match='"Not supported empty dictionary"'):
-        q.sync('"()!()"', {})
 
     q.disconnect()
     assert q.sync("1+1") == 2

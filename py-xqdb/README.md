@@ -366,7 +366,7 @@ Other selected backends receive the equivalent representation that Narwhals can 
 | nested numeric list  | general list of typed q vectors |
 | eager DataFrame      | table |
 
-> Dictionary serialization requires `str` keys.
+> Dictionary serialization requires `str` keys. An empty `dict` serializes as `` (`symbol$())!() ``, and an empty q dictionary — `()!()`, `` (`symbol$())!() ``, or `` 0#`a`b!1 2 `` — deserializes to `{}`, so a dictionary read from q can always be sent back.
 
 ## Resources
 

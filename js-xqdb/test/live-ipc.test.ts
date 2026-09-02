@@ -128,6 +128,18 @@ describe.runIf(liveEnabled)("live q IPC", () => {
     );
   });
 
+  it("round-trips empty dictionaries as (`symbol$())!()", async () => {
+    const q = await trackedConnectedQ();
+    await expect(q.sync("()!()")).resolves.toEqual({});
+    await expect(q.sync("(`symbol$())!()")).resolves.toEqual({});
+    await expect(q.sync("0#`a`b!1 2")).resolves.toEqual({});
+    await expect(q.sync("{x}", {})).resolves.toEqual({});
+    await expect(q.sync("{x~(`symbol$())!()}", {})).resolves.toBe(true);
+    await expect(q.sync("{x}", { nested: {} })).resolves.toEqual({ nested: {} });
+    await expect(serializeAsIpcBytes6("sync", false, {})).resolves.toEqual(
+      Buffer.from([1, 1, 0, 0, 21, 0, 0, 0, 99, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    );
+  });
 
   it("reads and q-acknowledges an Arrow table send", async () => {
     const q = await trackedConnectedQ();
